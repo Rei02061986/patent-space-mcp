@@ -1,0 +1,480 @@
+"""Compute Startability Surface: S(v, f, t) for firm-cluster pairs.
+
+Pilot mode: top N firms × top M clusters.
+Full mode: all firm-cluster pairs with Gate=1.
+Also computes tech_cluster_momentum and firm velocity/direction.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import struct
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from db.migrations import SCHEMA_SQL
+
+try:
+    import numpy as np
+except ImportError as exc:
+    np = None
+    _NP_ERR = exc
+else:
+    _NP_ERR = None
+
+EMBED_DIM = 64
+
+
+def _require_numpy() -> None:
+    if np is None:
+        raise SystemExit(f"numpy is required: {_NP_ERR}")
+
+
+def _unpack(blob: bytes | None) -> "np.ndarray | None":
+    if blob is None:
+        return None
+    try:
+        return np.array(struct.unpack("64d", blob), dtype=np.float64)
+    except (struct.error, TypeError):
+        return None
+
+
+def _phi_tech_cosine(y_v: "np.ndarray", h_ft: "np.ndarray") -> float:
+    na, nb = np.linalg.norm(y_v), np.linalg.norm(h_ft)
+    if na == 0 or nb == 0:
+        return 0.0
+    return float(np.dot(y_v, h_ft) / (na * nb))
+
+
+def _phi_tech_distance(y_v: "np.ndarray", h_ft: "np.ndarray") -> float:
+    return float(1.0 / (1.0 + np.linalg.norm(y_v - h_ft)))
+
+
+def _gate(cos_sim: float, cpc_overlap: float, cite_prox: float) -> bool:
+    return cpc_overlap > 0.01 or cite_prox > 0 or cos_sim > 0.3
+
+
+def _sigmoid(x: float) -> float:
+    if x > 500:
+        return 1.0
+    if x < -500:
+        return 0.0
+    return float(1.0 / (1.0 + np.exp(-x)))
+
+
+def run_surface(
+    db_path: str = "data/patents.db",
+    year: int = 2024,
+    top_firms: int | None = 50,
+    top_clusters: int | None = 50,
+    alpha: float = -4.0,
+    beta_tech: list[float] | None = None,
+    country_code: str | None = "JP",
+    use_full_cpc_overlap: bool = False,
+) -> dict[str, int]:
+    """Compute startability surface.
+
+    Default parameters calibrated 2026-02-24 (iteration 2):
+      alpha = -4.0, beta_tech = [6.0, 3.0, 2.0, 1.0]
+    Target: Toyota×auto > 0.8, Suntory×semi < 0.4, std > 0.15
+    Result: std=0.165, Toyota=0.98, weak=0.42
+    """
+    _require_numpy()
+    if beta_tech is None:
+        # Calibrated 2026-02-24 (iteration 2)
+        beta_tech_arr = np.array([6.0, 3.0, 2.0, 1.0])
+    else:
+        beta_tech_arr = np.array(beta_tech)
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA_SQL)
+    conn.execute("PRAGMA journal_mode=WAL")
+
+    # --- Load firms with tech vectors ---
+    firm_query = """
+        SELECT firm_id, tech_vector, patent_count, dominant_cpc
+        FROM firm_tech_vectors
+        WHERE year = ? AND tech_vector IS NOT NULL
+        ORDER BY patent_count DESC
+    """
+    if top_firms is not None:
+        firm_query += f" LIMIT {int(top_firms)}"
+    firm_rows = conn.execute(firm_query, (year,)).fetchall()
+
+    firms: dict[str, "np.ndarray"] = {}
+    firm_dom_cpc: dict[str, str | None] = {}
+    for row in firm_rows:
+        vec = _unpack(row["tech_vector"])
+        if vec is not None:
+            firms[row["firm_id"]] = vec
+            firm_dom_cpc[row["firm_id"]] = row["dominant_cpc"]
+
+    print(f"Loaded {len(firms)} firms with tech vectors for year {year}")
+    sys.stdout.flush()
+
+    # --- Load clusters ---
+    cluster_query = """
+        SELECT cluster_id, center_vector, cpc_codes, cpc_class, patent_count
+        FROM tech_clusters
+        WHERE center_vector IS NOT NULL
+        ORDER BY patent_count DESC
+    """
+    if top_clusters is not None:
+        cluster_query += f" LIMIT {int(top_clusters)}"
+    cluster_rows = conn.execute(cluster_query).fetchall()
+
+    clusters: dict[str, dict] = {}
+    for row in cluster_rows:
+        vec = _unpack(row["center_vector"])
+        if vec is not None:
+            cpc_codes_raw = row["cpc_codes"]
+            try:
+                cpc_set = set(json.loads(cpc_codes_raw)) if cpc_codes_raw else set()
+            except json.JSONDecodeError:
+                cpc_set = set()
+            clusters[row["cluster_id"]] = {
+                "center": vec,
+                "cpc_codes": cpc_set,
+                "cpc_class": row["cpc_class"],
+            }
+
+    print(f"Loaded {len(clusters)} clusters")
+    sys.stdout.flush()
+
+    firm_ids_list = list(firms.keys())
+    firm_cpc: dict[str, set[str]] | None = None
+
+    if use_full_cpc_overlap:
+        firm_cpc = {fid: set() for fid in firm_ids_list}
+
+        # Chunked IN queries (avoid scanning all assignees for global datasets)
+        print("Loading firm CPC codes (filtered by selected firms) ...")
+        sys.stdout.flush()
+
+        def _chunks(items: list[str], chunk_size: int) -> list[list[str]]:
+            return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+        cpc_count = 0
+        for chunk in _chunks(firm_ids_list, 900):
+            placeholders = ",".join(["?"] * len(chunk))
+            q = f"""
+                SELECT pa.firm_id, pc.cpc_code
+                FROM patent_assignees pa
+                JOIN patent_cpc pc ON pc.publication_number = pa.publication_number
+                JOIN patents p ON p.publication_number = pa.publication_number
+                WHERE pa.firm_id IN ({placeholders})
+                  AND pc.cpc_code IS NOT NULL
+                  AND (? IS NULL OR p.country_code = ?)
+            """
+            cur = conn.execute(q, (*chunk, country_code, country_code))
+            for row in cur:
+                fid = row["firm_id"]
+                if fid in firm_cpc:
+                    firm_cpc[fid].add(row["cpc_code"])
+                    cpc_count += 1
+
+        print(f"Loaded {cpc_count:,} CPC codes for {sum(1 for s in firm_cpc.values() if s):,} firms")
+        sys.stdout.flush()
+
+    # --- Compute surface ---
+    total_pairs = len(firms) * len(clusters)
+    print(f"Computing surface: {len(firms)} firms x {len(clusters)} clusters = {total_pairs:,} pairs")
+    sys.stdout.flush()
+
+    gate_open_count = 0
+    gate_closed_count = 0
+    start_time = time.time()
+
+    conn.execute("DELETE FROM startability_surface WHERE year = ?", (year,))
+    conn.commit()
+
+    batch_size = 50000
+    surface_buf: list[tuple] = []
+
+    for fi, (firm_id, h_ft) in enumerate(firms.items()):
+        f_dom = firm_dom_cpc.get(firm_id)
+        f_cpc = firm_cpc.get(firm_id, set()) if firm_cpc is not None else None
+
+        for cluster_id, cluster_data in clusters.items():
+            y_v = cluster_data["center"]
+            c_cpc = cluster_data["cpc_codes"]
+            c_class = cluster_data.get("cpc_class")
+
+            # φ_tech components
+            cos_sim = _phi_tech_cosine(y_v, h_ft)
+            dist_sim = _phi_tech_distance(y_v, h_ft)
+            if f_cpc is None:
+                cpc_overlap = 1.0 if (f_dom and c_class and f_dom == c_class) else 0.0
+            else:
+                cpc_overlap = 0.0
+                if f_cpc and c_cpc:
+                    intersection = f_cpc & c_cpc
+                    union = f_cpc | c_cpc
+                    cpc_overlap = len(intersection) / len(union) if union else 0.0
+
+            # Citation proximity (simplified — full version needs per-cluster patent sets)
+            cite_prox = 0.0  # Will be enhanced when citation graph is available
+
+            # Gate
+            is_open = _gate(cos_sim, cpc_overlap, cite_prox)
+
+            if is_open:
+                gate_open_count += 1
+                phi = np.array([cos_sim, dist_sim, cpc_overlap, cite_prox])
+                logit = alpha + np.dot(beta_tech_arr, phi)
+                score = _sigmoid(logit)
+            else:
+                gate_closed_count += 1
+                score = 0.0
+
+            surface_buf.append((
+                cluster_id,
+                firm_id,
+                year,
+                score,
+                1 if is_open else 0,
+                cos_sim,
+                dist_sim,
+                cpc_overlap,
+                cite_prox,
+                None,  # phi_org — future
+                None,  # phi_dyn — future
+            ))
+
+            if len(surface_buf) >= batch_size:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO startability_surface (
+                        cluster_id, firm_id, year, score, gate_open,
+                        phi_tech_cos, phi_tech_dist, phi_tech_cpc, phi_tech_cite,
+                        phi_org, phi_dyn
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    surface_buf,
+                )
+                conn.commit()
+                surface_buf = []
+
+        if (fi + 1) % 10 == 0:
+            elapsed = time.time() - start_time
+            print(
+                f"  Processed {fi+1}/{len(firms)} firms, "
+                f"gate_open={gate_open_count}, gate_closed={gate_closed_count}, "
+                f"elapsed={elapsed:.1f}s"
+            )
+            sys.stdout.flush()
+
+    if surface_buf:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO startability_surface (
+                cluster_id, firm_id, year, score, gate_open,
+                phi_tech_cos, phi_tech_dist, phi_tech_cpc, phi_tech_cite,
+                phi_org, phi_dyn
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            surface_buf,
+        )
+        conn.commit()
+
+    elapsed = time.time() - start_time
+    print(f"\nSurface computation complete.")
+    print(f"  Total pairs: {total_pairs:,}")
+    print(f"  Gate open:   {gate_open_count:,} ({gate_open_count/total_pairs*100:.1f}%)")
+    print(f"  Gate closed: {gate_closed_count:,} ({gate_closed_count/total_pairs*100:.1f}%)")
+    print(f"  Elapsed:     {elapsed:.1f}s")
+    sys.stdout.flush()
+
+    conn.close()
+    return {
+        "total_pairs": total_pairs,
+        "gate_open": gate_open_count,
+        "gate_closed": gate_closed_count,
+    }
+
+
+def run_momentum(
+    db_path: str = "data/patents.db",
+) -> int:
+    """Compute tech_cluster_momentum from tech_clusters yearly_counts."""
+    _require_numpy()
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA_SQL)
+
+    rows = conn.execute(
+        "SELECT cluster_id, yearly_counts FROM tech_clusters WHERE yearly_counts IS NOT NULL"
+    ).fetchall()
+
+    conn.execute("DELETE FROM tech_cluster_momentum")
+
+    momentum_rows: list[tuple] = []
+    for row in rows:
+        cluster_id = row["cluster_id"]
+        try:
+            yearly = json.loads(row["yearly_counts"])
+        except json.JSONDecodeError:
+            continue
+
+        sorted_years = sorted(int(y) for y in yearly.keys())
+        prev_count = None
+        prev_growth = None
+
+        for yr in sorted_years:
+            count = yearly[str(yr)]
+            growth_rate = 0.0
+            acceleration = 0.0
+
+            if prev_count is not None and prev_count > 0:
+                growth_rate = (count - prev_count) / prev_count
+
+            if prev_growth is not None:
+                acceleration = growth_rate - prev_growth
+
+            momentum_rows.append((
+                cluster_id, yr, count, growth_rate, acceleration
+            ))
+            prev_count = count
+            prev_growth = growth_rate
+
+    if momentum_rows:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO tech_cluster_momentum (
+                cluster_id, year, patent_count, growth_rate, acceleration
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            momentum_rows,
+        )
+
+    conn.commit()
+    conn.close()
+    return len(momentum_rows)
+
+
+def run_velocity(
+    db_path: str = "data/patents.db",
+    year_from: int = 2016,
+    year_to: int = 2024,
+) -> int:
+    """Compute tech velocity and direction for firms (h_{f,t} - h_{f,t-1})."""
+    _require_numpy()
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    # Check if velocity columns exist, add if not
+    cols = [
+        row[1]
+        for row in conn.execute("PRAGMA table_info(firm_tech_vectors)").fetchall()
+    ]
+    if "velocity" not in cols:
+        conn.execute("ALTER TABLE firm_tech_vectors ADD COLUMN velocity REAL")
+    if "direction_vector" not in cols:
+        conn.execute("ALTER TABLE firm_tech_vectors ADD COLUMN direction_vector BLOB")
+    conn.commit()
+
+    rows = conn.execute(
+        """
+        SELECT firm_id, year, tech_vector
+        FROM firm_tech_vectors
+        WHERE tech_vector IS NOT NULL
+          AND year BETWEEN ? AND ?
+        ORDER BY firm_id, year
+        """,
+        (year_from - 1, year_to),
+    ).fetchall()
+
+    # Group by firm
+    from collections import defaultdict
+    firm_vecs: dict[str, dict[int, "np.ndarray"]] = defaultdict(dict)
+    for row in rows:
+        vec = _unpack(row["tech_vector"])
+        if vec is not None:
+            firm_vecs[row["firm_id"]][row["year"]] = vec
+
+    updated = 0
+    for firm_id, year_vecs in firm_vecs.items():
+        for yr in range(year_from, year_to + 1):
+            if yr not in year_vecs or (yr - 1) not in year_vecs:
+                continue
+            diff = year_vecs[yr] - year_vecs[yr - 1]
+            velocity = float(np.linalg.norm(diff))
+            direction_blob = None
+            if velocity > 1e-12:
+                direction = diff / velocity
+                direction_blob = struct.pack("64d", *direction.tolist())
+
+            conn.execute(
+                """
+                UPDATE firm_tech_vectors
+                SET velocity = ?, direction_vector = ?
+                WHERE firm_id = ? AND year = ?
+                """,
+                (velocity, direction_blob, firm_id, yr),
+            )
+            updated += 1
+
+    conn.commit()
+    conn.close()
+    return updated
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Compute Startability Surface, cluster momentum, and firm velocity."
+    )
+    parser.add_argument("--db", default="data/patents.db", help="SQLite DB path")
+    parser.add_argument("--year", type=int, default=2024, help="Year for surface computation")
+    parser.add_argument("--top-firms", type=int, default=50, help="Top N firms (0=all)")
+    parser.add_argument("--top-clusters", type=int, default=50, help="Top M clusters (0=all)")
+    parser.add_argument("--skip-surface", action="store_true", help="Skip surface computation")
+    parser.add_argument("--skip-momentum", action="store_true", help="Skip momentum computation")
+    parser.add_argument("--skip-velocity", action="store_true", help="Skip velocity computation")
+    parser.add_argument(
+        "--country-code",
+        default="JP",
+        help="Restrict CPC overlap computation to patents.country_code (use ALL for no filter)",
+    )
+    parser.add_argument(
+        "--use-full-cpc-overlap",
+        action="store_true",
+        help="Compute CPC overlap from all firm CPC codes (slow on large datasets).",
+    )
+    args = parser.parse_args()
+
+    top_firms = args.top_firms if args.top_firms > 0 else None
+    top_clusters = args.top_clusters if args.top_clusters > 0 else None
+
+    if not args.skip_surface:
+        print("=== Computing Startability Surface ===")
+        country_code = None if str(args.country_code).upper() in {"ALL", "ANY", "*", ""} else args.country_code
+        result = run_surface(
+            db_path=args.db,
+            year=args.year,
+            top_firms=top_firms,
+            top_clusters=top_clusters,
+            country_code=country_code,
+            use_full_cpc_overlap=bool(args.use_full_cpc_overlap),
+        )
+        print(f"Surface: {result}")
+
+    if not args.skip_momentum:
+        print("\n=== Computing Cluster Momentum ===")
+        n = run_momentum(db_path=args.db)
+        print(f"Momentum rows: {n:,}")
+
+    if not args.skip_velocity:
+        print("\n=== Computing Firm Velocity ===")
+        n = run_velocity(db_path=args.db)
+        print(f"Velocity rows updated: {n:,}")
+
+
+if __name__ == "__main__":
+    main()

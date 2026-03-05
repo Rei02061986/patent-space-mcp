@@ -1,0 +1,35 @@
+[project]
+name = "patent-space-mcp"
+version = "0.3.0"
+description = "MCP server for worldwide patent intelligence — 18 tools covering search, portfolio analysis, technology landscape, startability scoring, cross-domain discovery, adversarial strategy, and patent-market fusion."
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.14,<3",
+    "numpy>=1.26",
+    "thefuzz[speedup]>=0.22",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+bigquery = [
+    "google-cloud-bigquery>=3.25",
+    "pyarrow>=17.0",
+    "db-dtypes>=1.3",
+]
+compute = [
+    "scikit-learn>=1.4",
+]
+epo = [
+    "requests>=2.31",
+]
+
+[tool.setuptools.packages.find]
+include = ["sources*", "normalize*", "entity*", "db*", "tools*", "ingest*", "space*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
