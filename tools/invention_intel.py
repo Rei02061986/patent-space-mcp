@@ -4,15 +4,16 @@ Given a technology description, identifies the relevant patent cluster,
 provides prior art analysis, FTO risk assessment, whitespace opportunities,
 and strategic recommendations.
 
+v6: Added CPC keyword fallback for cluster matching. When text contains
+domain keywords (e.g., "全固体電池", "battery"), maps them directly to
+CPC codes (H01M) and finds clusters via cpc_class match. This fixes
+the issue where "全固体電池の固体電解質材料" returned no clusters because
+LIKE '%battery%' didn't match "batteries" in cluster labels.
+
 v5: "FTS-cold-aware" — when first FTS5 query hits hard_deadline, immediately
 abandons ALL subsequent FTS5-based approaches. Goes straight to pre-warmed-
 data-only fallbacks (cluster label matching). This reduces cold-page latency
 from 33-48s to ~2-5s (one I/O stall + instant fallback).
-
-Root cause: SQLite's progress handler fires every 50K VM instructions, but
-HDD I/O stalls block the VM entirely for 2-5s per read. Multiple FTS5
-retries across text_to_proxy_embedding → find_matching_clusters →
-_fts_cpc_fallback accumulated 17+ stalls × 2-5s = 33-48s.
 """
 from __future__ import annotations
 
@@ -163,6 +164,91 @@ def _cluster_label_fallback(
 
     results.sort(key=lambda x: x["similarity"], reverse=True)
     return results[:top_k]
+
+
+# Keyword → CPC direct mapping (covers common Japanese/English tech terms)
+_KEYWORD_CPC = {
+    "電池": "H01M", "バッテリー": "H01M", "battery": "H01M",
+    "全固体電池": "H01M", "solid-state battery": "H01M", "固体電解質": "H01M",
+    "リチウム": "H01M", "lithium": "H01M",
+    "半導体": "H01L", "semiconductor": "H01L",
+    "AI": "G06N", "人工知能": "G06N", "機械学習": "G06N", "machine learning": "G06N",
+    "深層学習": "G06N", "deep learning": "G06N", "ニューラル": "G06N",
+    "自動運転": "B60W", "autonomous driving": "B60W", "ADAS": "B60W",
+    "ロボット": "B25J", "robot": "B25J",
+    "5G": "H04W", "通信": "H04W", "wireless": "H04W",
+    "量子": "G06N", "quantum": "G06N",
+    "水素": "C01B", "hydrogen": "C01B",
+    "燃料電池": "H01M", "fuel cell": "H01M",
+    "有機EL": "H10K", "OLED": "H10K",
+    "太陽電池": "H02S", "solar cell": "H02S", "solar": "H02S",
+    "医薬": "A61K", "pharmaceutical": "A61K", "drug": "A61K",
+    "遺伝子": "C12N", "gene": "C12N", "CRISPR": "C12N",
+    "ブロックチェーン": "G06Q", "blockchain": "G06Q",
+    "3Dプリンタ": "B33Y", "additive manufacturing": "B33Y",
+    "EV": "B60L", "電気自動車": "B60L", "electric vehicle": "B60L",
+    "ドローン": "B64U", "drone": "B64U", "UAV": "B64U",
+    "触媒": "B01J", "catalyst": "B01J",
+    "フィルタ": "B01D", "filter": "B01D", "濾過": "B01D",
+    "樹脂": "C08L", "resin": "C08L", "ポリマー": "C08L", "polymer": "C08L",
+    "センサー": "G01N", "sensor": "G01N",
+    "ディスプレイ": "G09G", "display": "G09G",
+    "メモリ": "G11C", "memory": "G11C",
+    "モーター": "H02K", "motor": "H02K",
+    "カメラ": "H04N", "camera": "H04N", "画像": "G06T", "image": "G06T",
+}
+
+
+def _cpc_keyword_fallback(
+    conn: sqlite3.Connection,
+    text: str,
+    top_k: int = 5,
+) -> list[dict]:
+    """Map text keywords directly to CPC codes, then find clusters by cpc_class.
+
+    This is the most reliable fallback — bypasses LIKE matching entirely.
+    Works because tech_clusters has cpc_class indexed.
+    """
+    text_lower = text.lower()
+    matched_cpcs: dict[str, float] = {}  # cpc → specificity score
+
+    for keyword, cpc in _KEYWORD_CPC.items():
+        if keyword.lower() in text_lower:
+            # Longer keywords are more specific → higher score
+            specificity = len(keyword) / 10.0
+            if cpc not in matched_cpcs or specificity > matched_cpcs[cpc]:
+                matched_cpcs[cpc] = specificity
+
+    if not matched_cpcs:
+        return []
+
+    # Query tech_clusters for each matched CPC
+    results = []
+    for cpc, specificity in sorted(matched_cpcs.items(), key=lambda x: -x[1]):
+        rows = conn.execute(
+            "SELECT cluster_id, label, cpc_class, patent_count, growth_rate "
+            "FROM tech_clusters WHERE cpc_class = ? ORDER BY patent_count DESC LIMIT ?",
+            (cpc, top_k),
+        ).fetchall()
+        for r in rows:
+            results.append({
+                "cluster_id": r["cluster_id"],
+                "label": r["label"],
+                "cpc_class": r["cpc_class"],
+                "similarity": round(min(specificity, 1.0), 4),
+                "patent_count": r["patent_count"],
+                "growth_rate": r["growth_rate"],
+                "match_method": "cpc_keyword_fallback",
+            })
+
+    # Deduplicate by cluster_id, keep highest similarity
+    seen: dict[str, dict] = {}
+    for r in results:
+        cid = r["cluster_id"]
+        if cid not in seen or r["similarity"] > seen[cid]["similarity"]:
+            seen[cid] = r
+
+    return sorted(seen.values(), key=lambda x: -x["similarity"])[:top_k]
 
 
 def _get_prior_art(
@@ -433,7 +519,12 @@ def invention_intelligence(
             fts_cold = True
             store._relax_timeout()
 
-    # Fallback: pre-warmed-data-only cluster label matching (instant, no FTS5)
+    # Fallback 1: CPC keyword mapping (most reliable — directly maps terms to CPC codes)
+    if not clusters:
+        conn = store._conn()
+        clusters = _cpc_keyword_fallback(conn, text, top_k=5)
+
+    # Fallback 2: pre-warmed-data-only cluster label matching (LIKE on labels)
     if not clusters:
         conn = store._conn()
         clusters = _cluster_label_fallback(conn, text, top_k=5)

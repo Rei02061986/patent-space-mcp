@@ -1,8 +1,8 @@
 """startability and startability_ranking tool implementations.
 
-v2: Auto-detect best available year when requested year has no data.
-This prevents empty results when data only covers 2016-2023 but
-MCP schema defaults to year=2024.
+v3: Smarter year auto-fallback. When requested year returns sparse data
+(e.g., year=2024 has only 1 cluster per firm), falls back to the year
+with the most data (typically 2023 with 607 clusters per firm).
 """
 from __future__ import annotations
 
@@ -108,6 +108,30 @@ def _latest_year_ss(conn, cluster_id=None, firm_id=None):
     else:
         return None
     return row["y"] if row and row["y"] else None
+
+
+def _best_year_ss(conn, cluster_id=None, firm_id=None):
+    """Find the year with the MOST data in startability_surface.
+
+    Unlike _latest_year_ss which returns MAX(year), this returns the year
+    with the highest row count. This is important because year=2024 may
+    have only 1 cluster per firm (sparse), while year=2023 has 607.
+    """
+    if cluster_id:
+        row = conn.execute(
+            "SELECT year, COUNT(*) as cnt FROM startability_surface "
+            "WHERE cluster_id = ? GROUP BY year ORDER BY cnt DESC, year DESC LIMIT 1",
+            (cluster_id,),
+        ).fetchone()
+    elif firm_id:
+        row = conn.execute(
+            "SELECT year, COUNT(*) as cnt FROM startability_surface "
+            "WHERE firm_id = ? GROUP BY year ORDER BY cnt DESC, year DESC LIMIT 1",
+            (firm_id,),
+        ).fetchone()
+    else:
+        return None
+    return row["year"] if row and row["year"] else None
 
 
 def _latest_year_ftv(conn, firm_id):
@@ -418,10 +442,11 @@ def startability_ranking(
                 (firm_id, year, top_n),
             ).fetchall()
 
-            # Year fallback
+            # Year fallback: trigger when results are empty OR sparse (<3)
+            # This handles year=2024 which has only 1 cluster per firm
             actual_year = year
-            if not rows:
-                best = _latest_year_ss(conn, firm_id=firm_id)
+            if len(rows) < min(3, top_n):
+                best = _best_year_ss(conn, firm_id=firm_id)
                 if best and best != year:
                     actual_year = best
                     rows = conn.execute(
@@ -487,10 +512,10 @@ def startability_ranking(
             (cluster_id, year, top_n),
         ).fetchall()
 
-        # Year fallback
+        # Year fallback: trigger when results are empty OR sparse (<3)
         actual_year = year
-        if not rows:
-            best = _latest_year_ss(conn, cluster_id=cluster_id)
+        if len(rows) < min(3, top_n):
+            best = _best_year_ss(conn, cluster_id=cluster_id)
             if best and best != year:
                 actual_year = best
                 rows = conn.execute(

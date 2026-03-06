@@ -47,12 +47,26 @@ def _get_cluster_label(conn, cluster_id):
 
 
 def _get_scores(conn, firm_id):
-    """Get startability scores for a firm (latest year)."""
+    """Get startability scores for a firm (year with most data).
+
+    Uses the year with the highest cluster count, NOT MAX(year).
+    This is critical because year=2024 may have only 1 cluster (B01D_0)
+    while year=2023 has 607 clusters with full coverage.
+    """
+    # Find year with most data for this firm
+    best_year_row = conn.execute(
+        "SELECT year, COUNT(*) as cnt FROM startability_surface "
+        "WHERE firm_id = ? GROUP BY year ORDER BY cnt DESC LIMIT 1",
+        (firm_id,),
+    ).fetchone()
+    if not best_year_row:
+        return {}
+
+    best_year = best_year_row["year"]
     rows = conn.execute(
         "SELECT cluster_id, score, gate_open, year FROM startability_surface "
-        "WHERE firm_id = ? AND year = (SELECT MAX(year) FROM startability_surface WHERE firm_id = ?) "
-        "ORDER BY score DESC",
-        (firm_id, firm_id),
+        "WHERE firm_id = ? AND year = ? ORDER BY score DESC",
+        (firm_id, best_year),
     ).fetchall()
     return {r["cluster_id"]: r["score"] for r in rows}
 
@@ -173,13 +187,25 @@ def sales_prospect(
     prospect_scores: dict[str, dict] = {}
 
     for cluster_id, label, cpc in target_clusters:
-        # Firms with low-medium score in this cluster (they need the tech)
+        # Find year with most firms for this cluster
+        best_year_row = conn.execute(
+            "SELECT year, COUNT(*) as cnt FROM startability_surface "
+            "WHERE cluster_id = ? GROUP BY year ORDER BY cnt DESC LIMIT 1",
+            (cluster_id,),
+        ).fetchone()
+        prospect_year = best_year_row["year"] if best_year_row else 2023
+
+        # Best licensing prospects: firms with gate_open=1 (they have CPC
+        # overlap / active interest) but score < 0.75 (not yet strong).
+        # This filters out: (1) zero-tech firms (gate_open=0, score<0.1)
+        # like bookstores/publishers, and (2) top players who don't need help.
         rows = conn.execute(
             "SELECT firm_id, score, gate_open FROM startability_surface "
-            "WHERE cluster_id = ? AND year = (SELECT MAX(year) FROM startability_surface WHERE cluster_id = ?) "
+            "WHERE cluster_id = ? AND year = ? "
             "AND firm_id != ? "
+            "AND gate_open = 1 AND score < 0.75 "
             "ORDER BY score ASC LIMIT ?",
-            (cluster_id, cluster_id, fid, target_count * 5),
+            (cluster_id, prospect_year, fid, target_count * 5),
         ).fetchall()
 
         for r in rows:
