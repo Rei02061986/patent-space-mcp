@@ -62,6 +62,10 @@ from tools.ma_target import ma_target
 from tools.patent_finance import patent_option_value, tech_volatility, portfolio_var, tech_beta
 from tools.ip_due_diligence import ip_due_diligence
 from tools.network_analysis import network_topology, knowledge_flow, network_resilience, tech_fusion_detector, tech_entropy
+from tools.sep_analysis import sep_search, sep_landscape, sep_portfolio, frand_analysis
+from tools.corporate_hierarchy import corporate_hierarchy, group_portfolio, group_startability
+from tools.claim_analysis import claim_analysis, claim_comparison, fto_analysis
+from tools.ai_classifier import create_category, classify_patents, category_landscape, portfolio_benchmark
 
 load_dotenv()
 
@@ -453,6 +457,84 @@ _VIS_HINTS = {
         "recommended_chart": "dual_axis",
         "title": "技術エントロピー",
         "data_mapping": {"x": "entropy_timeline[].year", "y_left": "entropy_timeline[].entropy", "y_right": "entropy_timeline[].total_filings"},
+    },
+    # ── SEP Analysis ──
+    "sep_search": {
+        "recommended_chart": "table",
+        "title": "SEP宣言検索",
+        "data_mapping": {"columns": ["patent_number", "standard_name", "declarant", "declaration_date"]},
+        "suggested_options": {"sortable": True, "page_size": 20},
+    },
+    "sep_landscape": {
+        "recommended_chart": "treemap",
+        "title": "標準必須特許ランドスケープ",
+        "data_mapping": {"labels": "top_declarants[].declarant", "values": "top_declarants[].count", "color": "top_declarants[].share"},
+    },
+    "sep_portfolio": {
+        "recommended_chart": "pie_and_bar",
+        "title": "SEPポートフォリオ",
+        "data_mapping": {"pie_labels": "standards_covered[].standard", "pie_values": "standards_covered[].count", "bar_labels": "yearly_trend[].year", "bar_values": "yearly_trend[].count"},
+    },
+    "frand_analysis": {
+        "recommended_chart": "stacked_bar",
+        "title": "FRAND分析",
+        "data_mapping": {"labels": "top_holders[].declarant", "values": "top_holders[].count", "share": "top_holders[].share"},
+    },
+    # ── Corporate Hierarchy ──
+    "corporate_hierarchy": {
+        "recommended_chart": "tree",
+        "title": "企業グループ構造",
+        "data_mapping": {"root": "root.firm_name", "children": "root.children[].firm_name"},
+    },
+    "group_portfolio": {
+        "recommended_chart": "stacked_bar",
+        "title": "グループ特許ポートフォリオ",
+        "data_mapping": {"labels": "members[].firm_name", "values": "members[].patent_count"},
+    },
+    "group_startability": {
+        "recommended_chart": "horizontal_bar",
+        "title": "グループStartability",
+        "data_mapping": {"labels": "member_scores[].firm_name", "values": "member_scores[].score"},
+        "suggested_options": {"sort": "descending", "show_values": True},
+    },
+    # ── Claim Analysis ──
+    "claim_analysis": {
+        "recommended_chart": "card",
+        "title": "特許スコープ分析",
+        "data_mapping": {"title": "patent.title", "scope": "scope_assessment.scope_level", "cpcs": "scope_assessment.all_cpcs"},
+    },
+    "claim_comparison": {
+        "recommended_chart": "heatmap",
+        "title": "特許比較分析",
+        "data_mapping": {"x": "patents[].publication_number", "y": "patents[].publication_number", "values": "pairwise_similarity[].combined"},
+    },
+    "fto_analysis": {
+        "recommended_chart": "dashboard",
+        "title": "FTO分析",
+        "data_mapping": {"risk_level": "risk_assessment.overall_risk", "blocking": "blocking_patents[]", "timeline": "expiry_timeline[]"},
+        "suggested_options": {"layout": "grid_2x2"},
+    },
+    # ── AI Classifier ──
+    "create_category": {
+        "recommended_chart": "card",
+        "title": "カテゴリ作成",
+        "data_mapping": {"title": "category_name", "count": "initial_patent_count"},
+    },
+    "classify_patents": {
+        "recommended_chart": "table",
+        "title": "特許分類結果",
+        "data_mapping": {"columns": ["publication_number", "title", "confidence", "method"]},
+    },
+    "category_landscape": {
+        "recommended_chart": "line_with_bar",
+        "title": "カテゴリランドスケープ",
+        "data_mapping": {"x": "timeline[].year", "y_bar": "timeline[].patent_count", "y_line": "timeline[].growth_rate"},
+    },
+    "portfolio_benchmark": {
+        "recommended_chart": "horizontal_bar",
+        "title": "ポートフォリオベンチマーク",
+        "data_mapping": {"labels": "peer_ranking[].firm_name", "values": "peer_ranking[].patent_count"},
+        "suggested_options": {"highlight_firm": True, "sort": "descending"},
     },
 }
 
@@ -1791,6 +1873,389 @@ def tool_ip_due_diligence(
         return raw
     return _enrich_firm_ids(raw)
 
+# =====================================================================
+# Tool 40: sep_search
+# =====================================================================
+@mcp.tool()
+def tool_sep_search(
+    query: Annotated[str | None, Field(description="Free-text search across standard names, declarants, and patent numbers.")] = None,
+    standard: Annotated[str | None, Field(description="Filter by standard name (e.g., '5G NR', 'LTE', 'Wi-Fi 6', 'HEVC').")] = None,
+    declarant: Annotated[str | None, Field(description="Filter by declarant/company name (partial match).")] = None,
+    patent_number: Annotated[str | None, Field(description="Filter by patent number.")] = None,
+    max_results: Annotated[int, Field(description="Maximum number of results (default: 20).")] = 20,
+    page: Annotated[int, Field(description="Page number for pagination (default: 1).")] = 1,
+    page_size: Annotated[int, Field(description="Results per page (default: 20, max: 100).")] = 20,
+) -> dict:
+    """Search SEP declarations by standard, patent, or company.
+
+    Searches the ETSI ISLD database of standard essential patent declarations.
+    Filter by standard name, declarant company, or patent number.
+
+    Args:
+        query: Free-text search (Japanese or English). Searches title and abstract.
+        standard: Filter by standard name (e.g., "5G NR", "LTE").
+        declarant: Filter by declarant/company name (partial match).
+        patent_number: Filter by patent number.
+        max_results: Maximum number of results (default: 20).
+
+    Returns:
+        Dict with declarations list, result count, and total matching count."""
+    return _safe_call(sep_search, _tool_name="sep_search", _timeout=30,
+        store=_store, query=query, standard=standard, declarant=declarant,
+        patent_number=patent_number, max_results=max_results,
+        page=page, page_size=page_size)
+
+
+# =====================================================================
+# Tool 41: sep_landscape
+# =====================================================================
+@mcp.tool()
+def tool_sep_landscape(
+    standard: Annotated[str | None, Field(description="Standard name to analyze (e.g., 'LTE', '5G NR'). If omitted, shows overview of all standards.")] = None,
+    standard_org: Annotated[str | None, Field(description="Filter by standards organization (e.g., 'ETSI', 'IEEE', 'ITU').")] = None,
+    date_from: Annotated[str | None, Field(description="Start date in YYYY-MM-DD format.")] = None,
+    date_to: Annotated[str | None, Field(description="End date in YYYY-MM-DD format.")] = None,
+    page: Annotated[int, Field(description="Page number for pagination (default: 1).")] = 1,
+    page_size: Annotated[int, Field(description="Results per page (default: 20, max: 100).")] = 20,
+) -> dict:
+    """Technology standard patent landscape for SEP declarations.
+
+    Shows top declarants, declaration trends, and concentration metrics
+    for a specific standard or overview of all standards.
+
+    Args:
+        standard: Standard name to analyze (e.g., "LTE", "5G NR").
+        standard_org: Filter by standards organization.
+        date_from: Start date filter.
+        date_to: End date filter.
+
+    Returns:
+        Standard summary, top declarants, declaration trends, and concentration metrics."""
+    return _safe_call(sep_landscape, _tool_name="sep_landscape", _timeout=30,
+        store=_store, standard=standard, standard_org=standard_org,
+        date_from=date_from, date_to=date_to,
+        page=page, page_size=page_size)
+
+
+# =====================================================================
+# Tool 42: sep_portfolio
+# =====================================================================
+@mcp.tool()
+def tool_sep_portfolio(
+    firm_query: Annotated[str, Field(description="Company name (any language) or stock ticker.")],
+    page: Annotated[int, Field(description="Page number for pagination (default: 1).")] = 1,
+    page_size: Annotated[int, Field(description="Results per page (default: 20, max: 100).")] = 20,
+) -> dict:
+    """Get a firm's SEP (Standard Essential Patent) portfolio analysis.
+
+    Shows which technology standards a company has declared essential patents for,
+    declaration trends over time, and comparison to peer declarants.
+
+    Args:
+        firm_query: Company name (any language) or stock ticker.
+
+    Returns:
+        Dict with total declarations, standards covered, yearly trend, and peer comparison."""
+    raw = _safe_call(sep_portfolio, _tool_name="sep_portfolio", _timeout=30,
+        store=_store, firm_query=firm_query, resolver=_resolver,
+        page=page, page_size=page_size)
+    if isinstance(raw, dict) and "error" in raw:
+        return raw
+    return _enrich_firm_ids(raw)
+
+
+# =====================================================================
+# Tool 43: frand_analysis
+# =====================================================================
+@mcp.tool()
+def tool_frand_analysis(
+    standard: Annotated[str, Field(description="Standard name to analyze (e.g., 'LTE', '5G NR', 'Wi-Fi 6', 'HEVC').")],
+    page: Annotated[int, Field(description="Page number for pagination (default: 1).")] = 1,
+    page_size: Annotated[int, Field(description="Results per page (default: 20, max: 100).")] = 20,
+) -> dict:
+    """FRAND licensing analysis for a technology standard.
+
+    Computes declaration concentration (HHI), identifies top patent holders,
+    and estimates royalty stack dynamics. Includes legal disclaimer.
+
+    Args:
+        standard: Standard name to analyze.
+
+    Returns:
+        Concentration metrics, top holders, licensing landscape, and royalty stack estimate."""
+    return _safe_call(frand_analysis, _tool_name="frand_analysis", _timeout=30,
+        store=_store, standard=standard,
+        page=page, page_size=page_size)
+
+
+# =====================================================================
+# Tool 44: corporate_hierarchy
+# =====================================================================
+@mcp.tool()
+def tool_corporate_hierarchy(
+    firm_query: Annotated[str, Field(description="Company name (any language) or stock ticker.")],
+    depth: Annotated[int, Field(description="Traversal depth from target node (default: 2).")] = 2,
+    include_patents: Annotated[bool, Field(description="Include patent counts per member (default: False).")] = False,
+) -> dict:
+    """Get corporate group structure (parent-subsidiary relationships).
+
+    Explores parent and subsidiary relationships for a company,
+    building a tree of the corporate group.
+
+    Args:
+        firm_query: Company name (any language) or stock ticker.
+        depth: Traversal depth (default: 2).
+        include_patents: Include patent counts per member.
+
+    Returns:
+        Group tree structure with members and relationship types."""
+    raw = _safe_call(corporate_hierarchy, _tool_name="corporate_hierarchy", _timeout=30,
+        store=_store, firm_query=firm_query, resolver=_resolver,
+        depth=depth, include_patents=include_patents)
+    if isinstance(raw, dict) and "error" in raw:
+        return raw
+    return _enrich_firm_ids(raw)
+
+
+# =====================================================================
+# Tool 45: group_portfolio
+# =====================================================================
+@mcp.tool()
+def tool_group_portfolio(
+    firm_query: Annotated[str, Field(description="Company name (any language) or stock ticker. Will find the corporate group.")],
+    year: Annotated[int, Field(description="Analysis year (default: 2024).")] = 2024,
+) -> dict:
+    """Aggregate patent portfolio across a corporate group.
+
+    Combines patent data from all group members (parent + subsidiaries)
+    to show the group's total technology footprint.
+
+    Args:
+        firm_query: Company name or ticker (finds entire group).
+        year: Analysis year (default: 2024).
+
+    Returns:
+        Combined patent count, member breakdown, and dominant CPCs."""
+    raw = _safe_call(group_portfolio, _tool_name="group_portfolio", _timeout=60,
+        store=_store, firm_query=firm_query, resolver=_resolver, year=year)
+    if isinstance(raw, dict) and "error" in raw:
+        return raw
+    return _enrich_firm_ids(raw)
+
+
+# =====================================================================
+# Tool 46: group_startability
+# =====================================================================
+@mcp.tool()
+def tool_group_startability(
+    firm_query: Annotated[str, Field(description="Company name (any language) or stock ticker.")],
+    tech_query_or_cluster_id: Annotated[str, Field(description='Cluster ID (e.g., "H01M_0") or technology keyword.')],
+    year: Annotated[int, Field(description="Analysis year (default: 2024).")] = 2024,
+) -> dict:
+    """Group-level startability analysis across corporate group members.
+
+    Evaluates each group member's readiness for a technology area and
+    identifies the strongest entity within the group.
+
+    Args:
+        firm_query: Company name or ticker.
+        tech_query_or_cluster_id: Cluster ID or technology keyword.
+        year: Analysis year (default: 2024).
+
+    Returns:
+        Group score, member scores, recommended entity, and synergy analysis."""
+    raw = _safe_call(group_startability, _tool_name="group_startability", _timeout=60,
+        store=_store, firm_query=firm_query,
+        tech_query_or_cluster_id=tech_query_or_cluster_id,
+        resolver=_resolver, year=year)
+    if isinstance(raw, dict) and "error" in raw:
+        return raw
+    return _enrich_firm_ids(raw)
+
+
+# =====================================================================
+# Tool 47: claim_analysis
+# =====================================================================
+@mcp.tool()
+def tool_claim_analysis(
+    publication_number: Annotated[str | None, Field(description='Patent publication number (e.g., "JP-7637366-B1").')] = None,
+    text: Annotated[str | None, Field(description="Technology description to analyze scope for.")] = None,
+) -> dict:
+    """Analyze patent's technical scope from abstract and CPC classification.
+
+    Extracts key technical elements, assesses scope breadth, and finds
+    related patents. Based on abstract analysis (not claim text).
+
+    Args:
+        publication_number: Patent to analyze.
+        text: Alternative: technology description text.
+
+    Returns:
+        Technical elements, scope assessment, CPC coverage, and related patents."""
+    return _safe_call(claim_analysis, _tool_name="claim_analysis", _timeout=60,
+        store=_store, publication_number=publication_number, text=text)
+
+
+# =====================================================================
+# Tool 48: claim_comparison
+# =====================================================================
+@mcp.tool()
+def tool_claim_comparison(
+    publication_numbers: Annotated[list[str], Field(description='List of patent publication numbers to compare (2-10 patents).')],
+) -> dict:
+    """Compare technical scope of multiple patents.
+
+    Computes pairwise CPC overlap and embedding similarity between patents.
+    Identifies shared and unique technology elements.
+
+    Args:
+        publication_numbers: List of patent numbers to compare.
+
+    Returns:
+        Pairwise similarity matrix, shared/unique CPCs, and overlap assessment."""
+    return _safe_call(claim_comparison, _tool_name="claim_comparison", _timeout=60,
+        store=_store, publication_numbers=publication_numbers)
+
+
+# =====================================================================
+# Tool 49: fto_analysis
+# =====================================================================
+@mcp.tool()
+def tool_fto_analysis(
+    text: Annotated[str | None, Field(description="Technology description for FTO analysis.")] = None,
+    cpc_codes: Annotated[list[str] | None, Field(description='CPC codes to check (e.g., ["H01M10", "H01M4"]).')] = None,
+    target_jurisdiction: Annotated[str, Field(description='Target jurisdiction (default: "JP").')] = "JP",
+    max_blocking: Annotated[int, Field(description="Maximum blocking patents to return (default: 20).")] = 20,
+) -> dict:
+    """Freedom-to-operate analysis for a technology area.
+
+    Identifies potential blocking patents, assesses risk by assignee,
+    and provides expiry timeline. Preliminary analysis — professional
+    patent attorney review required for actual FTO opinions.
+
+    Args:
+        text: Technology description.
+        cpc_codes: CPC codes to check.
+        target_jurisdiction: Target country (default: JP).
+        max_blocking: Max blocking patents to return.
+
+    Returns:
+        Risk assessment, blocking patents, risk by assignee, and expiry timeline."""
+    raw = _safe_call(fto_analysis, _tool_name="fto_analysis", _timeout=120,
+        store=_store, text=text, cpc_codes=cpc_codes,
+        target_jurisdiction=target_jurisdiction, max_blocking=max_blocking)
+    if isinstance(raw, dict) and "error" in raw:
+        return raw
+    return _enrich_firm_ids(raw)
+
+
+# =====================================================================
+# Tool 50: create_category
+# =====================================================================
+@mcp.tool()
+def tool_create_category(
+    category_name: Annotated[str, Field(description='Category name (e.g., "EV Battery", "Autonomous Driving Sensors").')],
+    description: Annotated[str | None, Field(description="Category description.")] = None,
+    cpc_patterns: Annotated[list[str] | None, Field(description='CPC prefix patterns (e.g., ["H01M10", "H01M4"]).')] = None,
+    keywords: Annotated[list[str] | None, Field(description='Keywords for matching (e.g., ["battery", "電池", "lithium"]).')] = None,
+) -> dict:
+    """Define a custom technology category and auto-classify initial patents.
+
+    Creates a category with CPC and keyword rules, then automatically
+    classifies matching patents. Use classify_patents to expand.
+
+    Args:
+        category_name: Human-readable category name.
+        description: Optional description.
+        cpc_patterns: CPC prefix patterns for rule-based matching.
+        keywords: Keywords for text-based matching.
+
+    Returns:
+        Category ID, initial patent count, and sample classified patents."""
+    return _safe_call(create_category, _tool_name="create_category", _timeout=120,
+        store=_store, category_name=category_name, description=description,
+        cpc_patterns=cpc_patterns, keywords=keywords)
+
+
+# =====================================================================
+# Tool 51: classify_patents
+# =====================================================================
+@mcp.tool()
+def tool_classify_patents(
+    category_id: Annotated[str, Field(description="Category ID to classify into (from create_category).")],
+    query: Annotated[str | None, Field(description="Optional query to find and classify new patents. If omitted, lists existing classifications.")] = None,
+    max_results: Annotated[int, Field(description="Maximum results (default: 100).")] = 100,
+    page: Annotated[int, Field(description="Page number (default: 1).")] = 1,
+    page_size: Annotated[int, Field(description="Results per page (default: 20).")] = 20,
+) -> dict:
+    """Classify patents into a custom category, or list existing classifications.
+
+    If query is provided: finds matching patents and classifies them.
+    If query is omitted: lists already-classified patents for the category.
+
+    Args:
+        category_id: Target category ID.
+        query: Optional search query for new classification.
+        max_results: Maximum new patents to classify.
+
+    Returns:
+        Classification results with confidence scores."""
+    return _safe_call(classify_patents, _tool_name="classify_patents", _timeout=120,
+        store=_store, category_id=category_id, query=query,
+        max_results=max_results, page=page, page_size=page_size)
+
+
+# =====================================================================
+# Tool 52: category_landscape
+# =====================================================================
+@mcp.tool()
+def tool_category_landscape(
+    category_id: Annotated[str, Field(description="Category ID to analyze (from create_category).")],
+) -> dict:
+    """Landscape analysis for a custom technology category.
+
+    Shows filing trends, top applicants, sub-technology areas,
+    and top-cited patents within the category.
+
+    Args:
+        category_id: Category to analyze.
+
+    Returns:
+        Timeline, top applicants, sub-areas, and growth assessment."""
+    raw = _safe_call(category_landscape, _tool_name="category_landscape", _timeout=120,
+        store=_store, category_id=category_id)
+    if isinstance(raw, dict) and "error" in raw:
+        return raw
+    return _enrich_firm_ids(raw)
+
+
+# =====================================================================
+# Tool 53: portfolio_benchmark
+# =====================================================================
+@mcp.tool()
+def tool_portfolio_benchmark(
+    firm_query: Annotated[str, Field(description="Company name (any language) or stock ticker.")],
+    category_id: Annotated[str, Field(description="Category ID to benchmark against (from create_category).")],
+) -> dict:
+    """Benchmark a firm's patent position within a custom category vs peers.
+
+    Computes market share, ranking, and gap analysis compared to
+    category leaders and peers.
+
+    Args:
+        firm_query: Company name or ticker.
+        category_id: Category to benchmark in.
+
+    Returns:
+        Firm metrics, peer ranking, gap analysis, and recommendations."""
+    raw = _safe_call(portfolio_benchmark, _tool_name="portfolio_benchmark", _timeout=120,
+        store=_store, firm_query=firm_query, category_id=category_id,
+        resolver=_resolver)
+    if isinstance(raw, dict) and "error" in raw:
+        return raw
+    return _enrich_firm_ids(raw)
+
+
 # Infrastructure: argument parsing, cache warm-up, HTTP app
 # =====================================================================
 
@@ -1929,13 +2394,15 @@ def _custom_http_app():
         _ALL_TOOL_NAMES = sorted(set(list(_VIS_HINTS.keys()) + [
             "similar_firms", "tech_gap", "cross_border_similarity",
             "patent_valuation", "portfolio_evolution", "tech_trend_alert",
-            "similar_firms", "tech_gap", "cross_border_similarity",
-            "patent_valuation", "portfolio_evolution", "tech_trend_alert",
             "sales_prospect", "bayesian_scenario",
             "citation_network", "tech_trend", "ma_target",
             "patent_option_value", "tech_volatility", "portfolio_var", "tech_beta",
             "network_topology", "knowledge_flow", "network_resilience",
-            "tech_fusion_detector", "tech_entropy",
+            "tech_fusion_detector", "tech_entropy", "ip_due_diligence",
+            "sep_search", "sep_landscape", "sep_portfolio", "frand_analysis",
+            "corporate_hierarchy", "group_portfolio", "group_startability",
+            "claim_analysis", "claim_comparison", "fto_analysis",
+            "create_category", "classify_patents", "category_landscape", "portfolio_benchmark",
         ]))
         return JSONResponse({
             "status": "ok" if db_ok else "degraded",

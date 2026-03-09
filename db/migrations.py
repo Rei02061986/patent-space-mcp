@@ -256,4 +256,151 @@ CREATE TABLE IF NOT EXISTS ingestion_log (
     last_publication_date INTEGER,
     status TEXT DEFAULT 'running'
 );
+
+-- Corporate hierarchy (parent-subsidiary relationships)
+CREATE TABLE IF NOT EXISTS corporate_hierarchy (
+    firm_id TEXT NOT NULL,
+    parent_firm_id TEXT NOT NULL,
+    relationship TEXT DEFAULT 'subsidiary',
+    ownership_pct REAL,
+    source TEXT DEFAULT 'manual',
+    PRIMARY KEY (firm_id, parent_firm_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hierarchy_parent ON corporate_hierarchy(parent_firm_id);
+
+-- Custom technology categories (user-defined)
+CREATE TABLE IF NOT EXISTS custom_categories (
+    category_id TEXT PRIMARY KEY,
+    category_name TEXT NOT NULL,
+    description TEXT,
+    cpc_patterns TEXT,
+    keyword_patterns TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    patent_count INTEGER DEFAULT 0
+);
+
+-- Patent-to-category mapping
+CREATE TABLE IF NOT EXISTS patent_category_mapping (
+    publication_number TEXT NOT NULL,
+    category_id TEXT NOT NULL,
+    confidence REAL DEFAULT 1.0,
+    method TEXT DEFAULT 'rule',
+    PRIMARY KEY (publication_number, category_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pcm_cat ON patent_category_mapping(category_id);
+
+-- SEP (Standard Essential Patent) declarations
+CREATE TABLE IF NOT EXISTS sep_declarations (
+    declaration_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    patent_number TEXT,
+    standard_name TEXT NOT NULL,
+    standard_org TEXT DEFAULT 'ETSI',
+    sso_project TEXT,
+    declarant TEXT NOT NULL,
+    declaration_date TEXT,
+    technical_area TEXT,
+    publication_number TEXT,
+    UNIQUE(patent_number, standard_name, declarant)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sep_standard ON sep_declarations(standard_name);
+CREATE INDEX IF NOT EXISTS idx_sep_declarant ON sep_declarations(declarant);
+CREATE INDEX IF NOT EXISTS idx_sep_pub ON sep_declarations(publication_number);
+
+-- Monitoring watches (user-defined patent alerts)
+CREATE TABLE IF NOT EXISTS monitoring_watches (
+    watch_id TEXT PRIMARY KEY,
+    watch_type TEXT NOT NULL,
+    target TEXT NOT NULL,
+    parameters TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    last_checked TEXT,
+    alert_threshold INTEGER DEFAULT 5
+);
+
+CREATE TABLE IF NOT EXISTS monitoring_alerts (
+    alert_id TEXT PRIMARY KEY,
+    watch_id TEXT NOT NULL,
+    detected_at TEXT DEFAULT (datetime('now')),
+    new_patents_count INTEGER DEFAULT 0,
+    patent_ids TEXT,
+    summary TEXT,
+    acknowledged INTEGER DEFAULT 0,
+    FOREIGN KEY (watch_id) REFERENCES monitoring_watches(watch_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_watch ON monitoring_alerts(watch_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_ack ON monitoring_alerts(acknowledged);
+
+-- PTAB trials
+CREATE TABLE IF NOT EXISTS ptab_trials (
+    trial_number TEXT PRIMARY KEY,
+    patent_number TEXT,
+    publication_number TEXT,
+    filing_date TEXT,
+    institution_decision_date TEXT,
+    prosecution_status TEXT,
+    accorded_filing_date TEXT,
+    petitioner TEXT,
+    patent_owner TEXT,
+    inventor_name TEXT,
+    application_number TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ptab_patent ON ptab_trials(patent_number);
+CREATE INDEX IF NOT EXISTS idx_ptab_pub ON ptab_trials(publication_number);
+CREATE INDEX IF NOT EXISTS idx_ptab_petitioner ON ptab_trials(petitioner);
+CREATE INDEX IF NOT EXISTS idx_ptab_owner ON ptab_trials(patent_owner);
+CREATE INDEX IF NOT EXISTS idx_ptab_status ON ptab_trials(prosecution_status);
+
+-- Litigation cases (from USPTO OCE)
+CREATE TABLE IF NOT EXISTS litigation_cases (
+    case_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_number TEXT,
+    court TEXT,
+    judge TEXT,
+    date_filed TEXT,
+    date_terminated TEXT,
+    plaintiff TEXT,
+    defendant TEXT,
+    nature_of_suit TEXT,
+    outcome TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_lit_number ON litigation_cases(case_number);
+CREATE INDEX IF NOT EXISTS idx_lit_plaintiff ON litigation_cases(plaintiff);
+CREATE INDEX IF NOT EXISTS idx_lit_defendant ON litigation_cases(defendant);
+CREATE INDEX IF NOT EXISTS idx_lit_date ON litigation_cases(date_filed);
+
+-- Litigation-patent link table
+CREATE TABLE IF NOT EXISTS litigation_patents (
+    case_id INTEGER,
+    patent_number TEXT,
+    PRIMARY KEY (case_id, patent_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_litpat_patent ON litigation_patents(patent_number);
+
+-- Citation index (pre-computed citation counts)
+CREATE TABLE IF NOT EXISTS citation_index (
+    publication_number TEXT PRIMARY KEY,
+    citing_count INTEGER DEFAULT 0,
+    cited_by_count INTEGER DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_citidx_cited_by ON citation_index(cited_by_count DESC);
+CREATE INDEX IF NOT EXISTS idx_citidx_citing ON citation_index(citing_count DESC);
+
+-- Display names for global entity resolution
+CREATE TABLE IF NOT EXISTS display_names (
+    assignee_raw TEXT PRIMARY KEY,
+    canonical_name TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    country TEXT,
+    sector TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_dn_canonical ON display_names(canonical_name);
 """
