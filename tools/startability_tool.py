@@ -14,6 +14,34 @@ from typing import Any
 import numpy as np
 
 from db.sqlite_store import PatentStore
+
+
+def _resolve_firm_id_with_fallback(resolved, conn, table="startability_surface"):
+    """Resolve entity to DB firm_id, with company_XXXX fallback."""
+    firm_id = resolved.entity.canonical_id
+    # Check if this firm_id exists in the target table
+    row = conn.execute(
+        f"SELECT COUNT(*) FROM {table} WHERE firm_id = ?", (firm_id,)
+    ).fetchone()
+    if row and row[0] > 0:
+        return firm_id
+    # Fallback: try company_{ticker}
+    ticker = getattr(resolved.entity, 'ticker', None)
+    if ticker:
+        alt_id = f"company_{ticker}"
+        row2 = conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE firm_id = ?", (alt_id,)
+        ).fetchone()
+        if row2 and row2[0] > 0:
+            return alt_id
+    # Fallback: LIKE match
+    like_row = conn.execute(
+        f"SELECT DISTINCT firm_id FROM {table} WHERE firm_id LIKE ? LIMIT 1",
+        (f"{firm_id}%",)
+    ).fetchone()
+    if like_row:
+        return like_row[0]
+    return firm_id  # Return original even if not found
 from entity.resolver import EntityResolver
 from tools.pagination import paginate
 from space.startability import (
@@ -111,27 +139,36 @@ def _latest_year_ss(conn, cluster_id=None, firm_id=None):
 
 
 def _best_year_ss(conn, cluster_id=None, firm_id=None):
-    """Find the year with the MOST data in startability_surface.
+    """Find the latest year with substantial data in startability_surface.
 
-    Unlike _latest_year_ss which returns MAX(year), this returns the year
-    with the highest row count. This is important because year=2024 may
-    have only 1 cluster per firm (sparse), while year=2023 has 607.
+    Picks the latest year whose row count is >= 90% of the max count.
+    This avoids picking ancient years when counts are nearly equal
+    (e.g., H01L_0 has 2762 in 2018 vs 2732 in 2023 — we want 2023).
     """
     if cluster_id:
-        row = conn.execute(
+        rows = conn.execute(
             "SELECT year, COUNT(*) as cnt FROM startability_surface "
-            "WHERE cluster_id = ? GROUP BY year ORDER BY cnt DESC, year DESC LIMIT 1",
+            "WHERE cluster_id = ? GROUP BY year ORDER BY cnt DESC",
             (cluster_id,),
-        ).fetchone()
+        ).fetchall()
     elif firm_id:
-        row = conn.execute(
+        rows = conn.execute(
             "SELECT year, COUNT(*) as cnt FROM startability_surface "
-            "WHERE firm_id = ? GROUP BY year ORDER BY cnt DESC, year DESC LIMIT 1",
+            "WHERE firm_id = ? GROUP BY year ORDER BY cnt DESC",
             (firm_id,),
-        ).fetchone()
+        ).fetchall()
     else:
         return None
-    return row["year"] if row and row["year"] else None
+    if not rows:
+        return None
+    max_cnt = rows[0]["cnt"]
+    threshold = max(1, int(max_cnt * 0.9))
+    # Among years with >= 90% of max count, pick the latest
+    best = max(
+        (r["year"] for r in rows if r["cnt"] >= threshold),
+        default=rows[0]["year"],
+    )
+    return best
 
 
 def _latest_year_ftv(conn, firm_id):
@@ -294,8 +331,8 @@ def startability(
         if resolved is None:
             return fit  # Can't resolve firm, return original error
 
-        firm_id = resolved.entity.canonical_id
         conn = store._conn()
+        firm_id = _resolve_firm_id_with_fallback(resolved, conn)
 
         # Resolve cluster
         cluster_row = _resolve_cluster(conn, tech_query_or_cluster_id)
@@ -327,11 +364,37 @@ def startability(
             ).fetchone()
 
         if ss_row is None:
+            # Graceful fallback: return score=0 with explanation
+            # Also find what clusters ARE available for this firm
+            available = []
+            try:
+                avail_rows = conn.execute(
+                    "SELECT cluster_id, score FROM startability_surface "
+                    "WHERE firm_id = ? ORDER BY score DESC LIMIT 10",
+                    (firm_id,),
+                ).fetchall()
+                available = [{"cluster_id": r["cluster_id"], "score": round(r["score"], 4)} for r in avail_rows]
+            except Exception:
+                pass
+
             return {
-                "error": f"No pre-computed data in startability_surface for firm_id='{firm_id}' cluster='{cluster_id}'",
+                "endpoint": "startability",
                 "firm_id": firm_id,
                 "cluster_id": cluster_id,
-                "suggestion": "This firm-technology pair may not have been pre-computed.",
+                "year": year,
+                "score": 0.0,
+                "gate_open": False,
+                "phi_tech_cosine": None,
+                "phi_tech_distance": None,
+                "phi_tech_cpc_jaccard": None,
+                "rank": None,
+                "note": "No pre-computed data available for this firm-cluster combination. The firm may not have filings in this technology area, or may not be in the pre-computed dataset.",
+                "available_clusters": available,
+                "suggestion": (
+                    f"This firm ({firm_id}) has data for {len(available)} clusters."
+                    if available else
+                    f"This firm ({firm_id}) is not in the pre-computed startability dataset."
+                ),
             }
 
         actual_year = ss_row["year"]
@@ -428,7 +491,7 @@ def startability_ranking(
                     "error": f"Could not resolve firm: '{query}'",
                     "suggestion": "Try the exact company name, Japanese name, or stock ticker",
                 }
-            firm_id = resolved.entity.canonical_id
+            firm_id = _resolve_firm_id_with_fallback(resolved, conn)
 
             rows = conn.execute(
                 """
@@ -502,11 +565,15 @@ def startability_ranking(
 
         rows = conn.execute(
             """
-            SELECT firm_id, score, gate_open,
-                   phi_tech_cos, phi_tech_dist, phi_tech_cpc
-            FROM startability_surface
-            WHERE cluster_id = ? AND year = ?
-            ORDER BY score DESC
+            SELECT ss.firm_id, ss.score, ss.gate_open,
+                   ss.phi_tech_cos, ss.phi_tech_dist, ss.phi_tech_cpc,
+                   COALESCE(ftv.patent_count, 0) as patent_count
+            FROM startability_surface ss
+            LEFT JOIN firm_tech_vectors ftv 
+                ON ss.firm_id = ftv.firm_id AND ftv.year = ss.year
+            WHERE ss.cluster_id = ? AND ss.year = ?
+              AND COALESCE(ftv.patent_count, 0) > 50
+            ORDER BY ss.score DESC, COALESCE(ftv.patent_count, 0) DESC
             LIMIT ?
             """,
             (cluster_id, year, top_n),
@@ -520,11 +587,15 @@ def startability_ranking(
                 actual_year = best
                 rows = conn.execute(
                     """
-                    SELECT firm_id, score, gate_open,
-                           phi_tech_cos, phi_tech_dist, phi_tech_cpc
-                    FROM startability_surface
-                    WHERE cluster_id = ? AND year = ?
-                    ORDER BY score DESC
+                    SELECT ss.firm_id, ss.score, ss.gate_open,
+                           ss.phi_tech_cos, ss.phi_tech_dist, ss.phi_tech_cpc,
+                           COALESCE(ftv.patent_count, 0) as patent_count
+                    FROM startability_surface ss
+                    LEFT JOIN firm_tech_vectors ftv
+                        ON ss.firm_id = ftv.firm_id AND ftv.year = ss.year
+                    WHERE ss.cluster_id = ? AND ss.year = ?
+                      AND COALESCE(ftv.patent_count, 0) > 50
+                    ORDER BY ss.score DESC, COALESCE(ftv.patent_count, 0) DESC
                     LIMIT ?
                     """,
                     (cluster_id, actual_year, top_n),
@@ -541,6 +612,19 @@ def startability_ranking(
         }
         for row in rows
     ]
+
+    # Tie-break: when multiple firms have identical scores (e.g., 1.0),
+    # re-rank by patent_count from firm_tech_vectors (higher = more relevant)
+    if results and len(set(r["score"] for r in results)) < len(results):
+        tie_firms = [r["firm_id"] for r in results]
+        ph = ",".join("?" * len(tie_firms))
+        pc_rows = conn.execute(
+            f"SELECT firm_id, patent_count FROM firm_tech_vectors "
+            f"WHERE firm_id IN ({ph}) AND year = ? ORDER BY patent_count DESC",
+            tie_firms + [actual_year],
+        ).fetchall()
+        pc_map = {r["firm_id"]: r["patent_count"] or 0 for r in pc_rows}
+        results.sort(key=lambda r: (-r["score"], -pc_map.get(r["firm_id"], 0)))
     paged = paginate(results, page=page, page_size=page_size)
     page_size_clamped = paged["page_size"]
     pages = math.ceil(len(results) / page_size_clamped) if results else 1

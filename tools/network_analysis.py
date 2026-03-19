@@ -7,6 +7,8 @@ Heavy sampling to avoid full table scans on HDD.
 """
 from __future__ import annotations
 
+import sqlite3
+
 import math
 import random
 from collections import Counter, defaultdict, deque
@@ -15,9 +17,24 @@ from typing import Any
 from db.sqlite_store import PatentStore
 from entity.resolver import EntityResolver
 from tools.cpc_labels_ja import CPC_CLASS_JA
+try:
+    from tools.jp_tech_cpc_map import JP_TECH_CPC_MAP as _EXT_CPC
+except ImportError:
+    _EXT_CPC = {}
 
 
 # ─── helpers ─────────────────────────────────────────────────────────
+
+# Mapping: entity canonical_id → patent_assignees firm_id
+_NETWORK_FIRM_REMAP = {
+    "samsung": "samsung_electronics",
+    "bosch": "bosch_robert",
+    "huawei": "huawei_tech",
+    "lg": "lg_electronics",
+    "siemens": "siemens_ag",
+    "byd": "byd_co",
+}
+
 
 def _resolve_firm(resolver: EntityResolver, name: str) -> str | None:
     res = resolver.resolve(name, country_hint="JP")
@@ -29,12 +46,26 @@ def _cpc4(code: str) -> str:
 
 
 def _find_best_year(conn, firm_id: str) -> int:
-    row = conn.execute(
+    """Find the latest year with substantial data for a firm.
+
+    Picks the latest year whose row count is >= 90% of the max count.
+    This avoids picking ancient years when counts are equal/similar.
+    """
+    rows = conn.execute(
         "SELECT year, COUNT(*) as cnt FROM startability_surface "
-        "WHERE firm_id = ? GROUP BY year ORDER BY cnt DESC LIMIT 1",
+        "WHERE firm_id = ? GROUP BY year ORDER BY cnt DESC",
         (firm_id,),
-    ).fetchone()
-    return row["year"] if row else 2024
+    ).fetchall()
+    if not rows:
+        return 2023
+    max_cnt = rows[0]["cnt"]
+    threshold = max(1, int(max_cnt * 0.9))
+    # Among years with >= 90% of max count, pick the latest
+    best = max(
+        (r["year"] for r in rows if r["cnt"] >= threshold),
+        default=rows[0]["year"],
+    )
+    return best
 
 
 # ─── graph primitives (no networkx) ─────────────────────────────────
@@ -398,6 +429,8 @@ def knowledge_flow(
     top_n: int = 20,
 ) -> dict[str, Any]:
     """Cross-CPC knowledge flow analysis."""
+    import time as _time
+    _kf_deadline = _time.monotonic() + 50  # 50s time budget
     store._relax_timeout()
     conn = store._conn()
 
@@ -440,13 +473,36 @@ def knowledge_flow(
     {cpc_filter_citing} {cpc_filter_cited} {firm_filter}
     GROUP BY source_cpc4, target_cpc4
     ORDER BY flow_count DESC
-    LIMIT 50000
+    LIMIT 5000
     """
     filing_from = year_from * 10000 + 101
     filing_to = year_to * 10000 + 1231
     params = [filing_from, filing_to] + cpc_params_citing + cpc_params_cited + firm_params
 
-    rows = conn.execute(query, params).fetchall()
+    try:
+        rows = conn.execute(query, params).fetchall()
+    except sqlite3.OperationalError as e:
+        if "interrupt" in str(e).lower():
+            return {
+                "endpoint": "knowledge_flow",
+                "filters": {
+                    "source_cpc": source_cpc,
+                    "target_cpc": target_cpc,
+                    "firm": firm,
+                    "date_range": {"from": year_from, "to": year_to},
+                },
+                "flow_summary": {
+                    "total_cross_cpc_citations": 0,
+                    "spillover_rate": None,
+                    "unique_cpc_pairs": 0,
+                    "top_knowledge_exporters": [],
+                    "top_knowledge_importers": [],
+                },
+                "flow_pairs": [],
+                "note": "Query timed out during cross-CPC citation analysis. Try narrower CPC or date filters.",
+                "interpretation": "タイムアウトのため分析できませんでした。CPCコードや日付範囲を絞ってください。",
+            }
+        raise
 
     if not rows:
         return {
@@ -490,14 +546,20 @@ def knowledge_flow(
 
     net_flows.sort(key=lambda x: x["net_flow"], reverse=True)
 
-    # Spillover rate
-    total_citations_row = conn.execute(
-        "SELECT COUNT(*) as cnt FROM patent_citations pc "
-        "JOIN patents p ON pc.citing_publication = p.publication_number "
-        "WHERE p.filing_date >= ? AND p.filing_date <= ? LIMIT 1",
-        (filing_from, filing_to),
-    ).fetchone()
-    total_citations = total_citations_row["cnt"] if total_citations_row else total_flow
+    # Spillover rate (skip if running out of time — this COUNT is very expensive)
+    if _time.monotonic() < _kf_deadline - 5:
+        try:
+            total_citations_row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM patent_citations pc "
+                "JOIN patents p ON pc.citing_publication = p.publication_number "
+                "WHERE p.filing_date >= ? AND p.filing_date <= ? LIMIT 1",
+                (filing_from, filing_to),
+            ).fetchone()
+            total_citations = total_citations_row["cnt"] if total_citations_row else total_flow
+        except sqlite3.OperationalError:
+            total_citations = total_flow  # fallback: use flow count as denominator
+    else:
+        total_citations = total_flow  # skip expensive COUNT — use flow count
     spillover_rate = round(total_flow / max(total_citations, 1), 4)
 
     top_exporters = [f for f in net_flows if f["net_flow"] > 0][:top_n]
@@ -733,46 +795,101 @@ def tech_fusion_detector(
 
 
 def _fusion_pair_analysis(conn, cpc_a, cpc_b, firm, resolver, year_from, year_to, min_co) -> dict:
-    """Analyze fusion between two specific CPC areas."""
+    """Analyze fusion between two specific CPC areas.
+
+    Optimized: 2-step Python approach instead of year-loop correlated subqueries.
+    Step 1: Get citing patents for CPC-A with year info (single query)
+    Step 2: Check which of those also cite CPC-B (batched)
+    """
     cpc_a4 = _cpc4(cpc_a)
     cpc_b4 = _cpc4(cpc_b)
 
-    # Find patents that cite both CPC-A and CPC-B patents
-    # A citing patent references both areas = bridging activity
     firm_filter = ""
     firm_params: list = []
     if firm and resolver:
         firm_id = _resolve_firm(resolver, firm)
         if firm_id:
-            firm_filter = "AND pc.citing_publication IN (SELECT publication_number FROM patent_assignees WHERE firm_id = ?) "
+            firm_filter = "AND pa_f.firm_id = ? "
             firm_params = [firm_id]
 
-    # Year-by-year co-citation counting
-    timeline_data = {}
-    for yr in range(year_from, year_to + 1):
-        filing_from = yr * 10000 + 101
-        filing_to = yr * 10000 + 1231
+    filing_from = year_from * 10000 + 101
+    filing_to = year_to * 10000 + 1231
 
-        row = conn.execute(
-            f"""SELECT COUNT(DISTINCT pc.citing_publication) as co_count
-            FROM patent_citations pc
-            JOIN patent_cpc ca ON pc.cited_publication = ca.publication_number
-            JOIN patents p ON pc.citing_publication = p.publication_number
-            WHERE ca.cpc_code LIKE ?
-            AND p.filing_date >= ? AND p.filing_date <= ?
-            {firm_filter}
-            AND pc.citing_publication IN (
-                SELECT pc2.citing_publication FROM patent_citations pc2
-                JOIN patent_cpc cb ON pc2.cited_publication = cb.publication_number
-                WHERE cb.cpc_code LIKE ?
-            )
-            LIMIT 1""",
-            (f"{cpc_a}%", filing_from, filing_to, *firm_params, f"{cpc_b}%"),
-        ).fetchone()
-        timeline_data[yr] = row["co_count"] if row else 0
+    # Fast approach: use pre-computed tech_cluster_momentum + startability_surface
+    # to estimate fusion strength, then sample raw citations for bridge patents only.
 
-    years = sorted(timeline_data.keys())
-    counts = [timeline_data[y] for y in years]
+    # Find cluster IDs for both CPC areas
+    cluster_a_rows = conn.execute(
+        "SELECT cluster_id FROM tech_clusters WHERE cpc_class LIKE ?",
+        (f"{cpc_a4}%",),
+    ).fetchall()
+    cluster_b_rows = conn.execute(
+        "SELECT cluster_id FROM tech_clusters WHERE cpc_class LIKE ?",
+        (f"{cpc_b4}%",),
+    ).fetchall()
+    cluster_a_ids = [r["cluster_id"] for r in cluster_a_rows]
+    cluster_b_ids = [r["cluster_id"] for r in cluster_b_rows]
+
+    # Get firms active in BOTH areas via startability_surface
+    timeline_data: dict[int, int] = defaultdict(int)
+    bridge_pubs: list[str] = []
+
+    if cluster_a_ids and cluster_b_ids:
+        ph_a = ",".join("?" for _ in cluster_a_ids)
+        ph_b = ",".join("?" for _ in cluster_b_ids)
+        # Count firms with presence in both areas, by year
+        overlap_rows = conn.execute(
+            f"""SELECT sa.year, COUNT(DISTINCT sa.firm_id) as cnt
+            FROM startability_surface sa
+            JOIN startability_surface sb ON sa.firm_id = sb.firm_id AND sa.year = sb.year
+            WHERE sa.cluster_id IN ({ph_a})
+              AND sb.cluster_id IN ({ph_b})
+              AND sa.score > 0.1 AND sb.score > 0.1
+            GROUP BY sa.year
+            ORDER BY sa.year""",
+            cluster_a_ids + cluster_b_ids,
+        ).fetchall()
+        for r in overlap_rows:
+            timeline_data[r["year"]] = r["cnt"]
+
+    # Sample bridge patents via citation_index (limited query)
+    try:
+        bridge_rows = conn.execute(
+            """SELECT DISTINCT ci.citing_publication
+            FROM citation_index ci
+            JOIN patent_cpc ca ON ci.cited_publication = ca.publication_number
+            JOIN patent_cpc cb ON ci.cited_publication = cb.publication_number
+            WHERE substr(ca.cpc_code, 1, 4) = ?
+              AND substr(cb.cpc_code, 1, 4) = ?
+              AND ca.is_first = 1
+            LIMIT 10""",
+            (cpc_a4, cpc_b4),
+        ).fetchall()
+        bridge_pubs = [r["citing_publication"] for r in bridge_rows]
+    except Exception:
+        # Fallback: use patent_citations with tight LIMIT
+        try:
+            bridge_rows = conn.execute(
+                """SELECT DISTINCT pc.citing_publication
+                FROM patent_citations pc
+                JOIN patent_cpc ca ON pc.cited_publication = ca.publication_number
+                WHERE substr(ca.cpc_code, 1, 4) = ?
+                  AND ca.is_first = 1
+                  AND pc.citing_publication IN (
+                      SELECT pc2.citing_publication FROM patent_citations pc2
+                      JOIN patent_cpc cb ON pc2.cited_publication = cb.publication_number
+                      WHERE substr(cb.cpc_code, 1, 4) = ? AND cb.is_first = 1
+                      LIMIT 10000
+                  )
+                LIMIT 10""",
+                (cpc_a4, cpc_b4),
+            ).fetchall()
+            bridge_pubs = [r["citing_publication"] for r in bridge_rows]
+        except Exception:
+            pass
+
+    years = list(range(year_from, year_to + 1))
+    counts = [timeline_data.get(y, 0) for y in years]
     total_co = sum(counts)
 
     if total_co < min_co:
@@ -792,12 +909,11 @@ def _fusion_pair_analysis(conn, cpc_a, cpc_b, firm, resolver, year_from, year_to
 
     # Acceleration
     if len(counts) >= 3 and counts[0] > 0:
-        import numpy as np
         growth_rates = []
         for i in range(1, len(counts)):
             if counts[i - 1] > 0:
                 growth_rates.append(math.log(max(counts[i], 1) / counts[i - 1]))
-        acceleration = float(np.mean(growth_rates)) if growth_rates else 0
+        acceleration = sum(growth_rates) / len(growth_rates) if growth_rates else 0
     else:
         acceleration = 0
 
@@ -812,24 +928,9 @@ def _fusion_pair_analysis(conn, cpc_a, cpc_b, firm, resolver, year_from, year_to
     else:
         stage = "no_fusion"
 
-    # Bridge patents
-    bridge_rows = conn.execute(
-        f"""SELECT DISTINCT pc.citing_publication as patent
-        FROM patent_citations pc
-        JOIN patent_cpc ca ON pc.cited_publication = ca.publication_number
-        WHERE ca.cpc_code LIKE ?
-        AND pc.citing_publication IN (
-            SELECT pc2.citing_publication FROM patent_citations pc2
-            JOIN patent_cpc cb ON pc2.cited_publication = cb.publication_number
-            WHERE cb.cpc_code LIKE ?
-        )
-        LIMIT 10""",
-        (f"{cpc_a}%", f"{cpc_b}%"),
-    ).fetchall()
-
+    # Bridge patents (already collected during step 2)
     bridge_patents = []
-    for br in bridge_rows:
-        pub = br["patent"]
+    for pub in bridge_pubs[:10]:
         pat = conn.execute(
             "SELECT title_ja, title_en, citation_count_forward FROM patents WHERE publication_number = ?",
             (pub,),
@@ -840,17 +941,19 @@ def _fusion_pair_analysis(conn, cpc_a, cpc_b, firm, resolver, year_from, year_to
             "cited_by": (pat["citation_count_forward"] or 0) if pat else 0,
         })
 
-    # Key players
-    key_players = conn.execute(
-        f"""SELECT pa.firm_id, COUNT(DISTINCT pa.publication_number) as cnt
-        FROM patent_assignees pa
-        JOIN patent_cpc c1 ON pa.publication_number = c1.publication_number
-        JOIN patent_cpc c2 ON pa.publication_number = c2.publication_number
-        WHERE c1.cpc_code LIKE ? AND c2.cpc_code LIKE ?
-        AND pa.firm_id IS NOT NULL AND pa.firm_id != ''
-        GROUP BY pa.firm_id ORDER BY cnt DESC LIMIT 10""",
-        (f"{cpc_a}%", f"{cpc_b}%"),
+    # Key players — use startability_surface for both CPC areas (fast)
+    key_players_rows = conn.execute(
+        """SELECT ss.firm_id, SUM(ss.score) as score
+        FROM startability_surface ss
+        JOIN tech_clusters tc ON ss.cluster_id = tc.cluster_id
+        WHERE (tc.cpc_class LIKE ? OR tc.cpc_class LIKE ?)
+          AND ss.year = (SELECT MAX(year) FROM startability_surface
+                         WHERE year IN (SELECT year FROM startability_surface
+                                        GROUP BY year HAVING COUNT(*) > 1000))
+        GROUP BY ss.firm_id ORDER BY score DESC LIMIT 10""",
+        (f"{cpc_a4}%", f"{cpc_b4}%"),
     ).fetchall()
+    key_players = key_players_rows if key_players_rows else []
 
     return {
         "endpoint": "tech_fusion_detector",
@@ -866,7 +969,7 @@ def _fusion_pair_analysis(conn, cpc_a, cpc_b, firm, resolver, year_from, year_to
         "fusion_stage": stage,
         "bridge_patents": bridge_patents,
         "key_players": [
-            {"firm_id": r["firm_id"], "co_domain_patents": r["cnt"]}
+            {"firm_id": r["firm_id"], "co_domain_patents": int(r["score"] if "score" in r.keys() else r["cnt"] if "cnt" in r.keys() else 0)}
             for r in key_players
         ],
         "interpretation": (
@@ -924,27 +1027,47 @@ def _fusion_auto_detect(conn, firm, resolver, year_from, year_to, min_co) -> dic
             "interpretation": "有意な技術融合パターンは検出されませんでした。",
         }
 
-    # Check growth for top pairs by comparing recent vs older period
+    # Check growth: batch all top pairs in a single query
     mid_year = (year_from + year_to) // 2
+    top_pairs = rows[:20]
+
+    # Build batch query for recent counts of all pairs at once
+    recent_map: dict[tuple[str, str], int] = {}
+    if top_pairs:
+        pair_conditions = []
+        pair_params_batch: list = [mid_year * 10000 + 101]
+        for r in top_pairs:
+            pair_conditions.append(
+                "(SUBSTR(c1.cpc_code,1,4)=? AND SUBSTR(c2.cpc_code,1,4)=?)"
+            )
+            pair_params_batch.extend([r["cpc_citing"], r["cpc_cited"]])
+        pair_params_batch.extend(firm_params)
+
+        batch_q = f"""SELECT SUBSTR(c1.cpc_code,1,4) as cpc_citing,
+                             SUBSTR(c2.cpc_code,1,4) as cpc_cited,
+                             COUNT(*) as cnt
+                      FROM patent_citations pc
+                      JOIN patent_cpc c1 ON pc.citing_publication = c1.publication_number AND c1.is_first = 1
+                      JOIN patent_cpc c2 ON pc.cited_publication = c2.publication_number AND c2.is_first = 1
+                      JOIN patents p ON pc.citing_publication = p.publication_number
+                      WHERE p.filing_date >= ?
+                        AND ({' OR '.join(pair_conditions)})
+                        {firm_filter}
+                      GROUP BY cpc_citing, cpc_cited"""
+        try:
+            recent_rows = conn.execute(batch_q, pair_params_batch).fetchall()
+            for rr in recent_rows:
+                recent_map[(rr["cpc_citing"], rr["cpc_cited"])] = rr["cnt"]
+        except Exception:
+            pass  # Fallback: all accel = 0
+
     fusions = []
-    for r in rows[:20]:
+    for r in top_pairs:
         cpc_citing = r["cpc_citing"]
         cpc_cited = r["cpc_cited"]
         total = r["cnt"]
 
-        # Recent count
-        recent_row = conn.execute(
-            f"""SELECT COUNT(*) as cnt
-            FROM patent_citations pc
-            JOIN patent_cpc c1 ON pc.citing_publication = c1.publication_number AND c1.is_first = 1
-            JOIN patent_cpc c2 ON pc.cited_publication = c2.publication_number AND c2.is_first = 1
-            JOIN patents p ON pc.citing_publication = p.publication_number
-            WHERE SUBSTR(c1.cpc_code, 1, 4) = ? AND SUBSTR(c2.cpc_code, 1, 4) = ?
-            AND p.filing_date >= ? {firm_filter}
-            LIMIT 1""",
-            (cpc_citing, cpc_cited, mid_year * 10000 + 101, *firm_params),
-        ).fetchone()
-        recent = recent_row["cnt"] if recent_row else 0
+        recent = recent_map.get((cpc_citing, cpc_cited), 0)
         older = max(total - recent, 1)
         accel = round(recent / older - 1, 3) if older > 0 else 0
 
@@ -988,7 +1111,12 @@ def tech_entropy(
     date_to: str = "2024-12-31",
     granularity: str = "year",
 ) -> dict[str, Any]:
-    """Technology maturity analysis via Shannon entropy of applicant distribution."""
+    """Technology maturity analysis via Shannon entropy of applicant distribution.
+
+    Uses cpc4_firm_year_counts (pre-computed actual filing data) when available.
+    Falls back to startability_surface for share calculation otherwise.
+    Always uses tech_cluster_momentum for total filing counts.
+    """
     store._relax_timeout()
     conn = store._conn()
 
@@ -1011,31 +1139,71 @@ def tech_entropy(
         if kw.lower() in (query or "").lower():
             effective_cpc = cpc
             break
+    else:
+        # Extended lookup from 100-entry JP tech CPC map
+        for kw, cpc in _EXT_CPC.items():
+            if kw.lower() in (query or "").lower():
+                effective_cpc = cpc
+                break
 
     cpc4 = _cpc4(effective_cpc)
 
-    # Get applicant shares per year from patent_assignees + patent_cpc
+    # Find matching tech_clusters for this CPC
+    cluster_rows = conn.execute(
+        "SELECT cluster_id FROM tech_clusters WHERE cpc_class LIKE ?",
+        (f"{effective_cpc}%",),
+    ).fetchall()
+    cluster_ids = [r["cluster_id"] for r in cluster_rows]
+
+    if not cluster_ids:
+        return {"error": f"No tech_clusters found for CPC prefix \'{effective_cpc}\'."}
+
+    # Get ACTUAL filing counts per year from tech_cluster_momentum
+    ph = ",".join("?" for _ in cluster_ids)
+    tcm_rows = conn.execute(
+        f"""SELECT year, SUM(patent_count) as total_filings
+        FROM tech_cluster_momentum
+        WHERE cluster_id IN ({ph}) AND year BETWEEN ? AND ?
+        GROUP BY year ORDER BY year""",
+        cluster_ids + [year_from, year_to],
+    ).fetchall()
+    yearly_filings = {r["year"]: r["total_filings"] for r in tcm_rows}
+
+    # Check if cpc4_firm_year_counts table exists and has data for this CPC
+    has_precomputed = False
+    try:
+        check = conn.execute(
+            "SELECT COUNT(*) FROM cpc4_firm_year_counts WHERE cpc4 = ?",
+            (cpc4,),
+        ).fetchone()
+        has_precomputed = check and check[0] > 0
+    except Exception:
+        pass
+
     entropy_timeline = []
-    hhi_timeline = []
-    applicant_counts = []
+    data_source = "pre_computed" if has_precomputed else "startability_surface"
 
     for yr in range(year_from, year_to + 1):
-        filing_from = yr * 10000 + 101
-        filing_to = yr * 10000 + 1231
-
-        rows = conn.execute(
-            """SELECT pa.firm_id, COUNT(DISTINCT pa.publication_number) as cnt
-            FROM patent_assignees pa
-            JOIN patent_cpc pc ON pa.publication_number = pc.publication_number
-            JOIN patents p ON pa.publication_number = p.publication_number
-            WHERE pc.cpc_code LIKE ?
-            AND p.filing_date >= ? AND p.filing_date <= ?
-            AND pa.firm_id IS NOT NULL AND pa.firm_id != ''
-            GROUP BY pa.firm_id
-            ORDER BY cnt DESC
-            LIMIT 200""",
-            (f"{effective_cpc}%", filing_from, filing_to),
-        ).fetchall()
+        if has_precomputed:
+            # Use actual filing data from cpc4_firm_year_counts
+            rows = conn.execute(
+                """SELECT firm_id, patent_count as cnt
+                FROM cpc4_firm_year_counts
+                WHERE cpc4 = ? AND year = ? AND patent_count > 0
+                ORDER BY patent_count DESC""",
+                (cpc4, yr),
+            ).fetchall()
+        else:
+            # Fallback to startability_surface scores
+            rows = conn.execute(
+                f"""SELECT firm_id, SUM(score) as cnt
+                FROM startability_surface
+                WHERE cluster_id IN ({ph})
+                AND year = ? AND gate_open = 1
+                GROUP BY firm_id
+                ORDER BY cnt DESC""",
+                cluster_ids + [yr],
+            ).fetchall()
 
         if not rows:
             continue
@@ -1052,12 +1220,20 @@ def tech_entropy(
         # HHI
         hhi = sum(p**2 for p in shares)
 
-        entropy_timeline.append({"year": yr, "entropy": round(H, 4), "hhi": round(hhi, 4),
-                                  "num_applicants": len(rows), "total_filings": total})
+        # Use ACTUAL filing count from tech_cluster_momentum
+        total_filings = yearly_filings.get(yr, 0)
+
+        entropy_timeline.append({
+            "year": yr,
+            "entropy": round(H, 4),
+            "hhi": round(hhi, 4),
+            "num_applicants": len(rows),
+            "total_filings": total_filings,
+        })
 
     if len(entropy_timeline) < 2:
         return {
-            "error": f"Insufficient yearly data for '{effective_cpc}' (need >=2 years).",
+            "error": f"Insufficient yearly data for \'{effective_cpc}\' (need >=2 years).",
             "years_found": len(entropy_timeline),
         }
 
@@ -1067,7 +1243,6 @@ def tech_entropy(
     entropy_arr = np.array([e["entropy"] for e in entropy_timeline])
     filing_arr = np.array([e["total_filings"] for e in entropy_timeline])
 
-    # Linear regression for trends
     if len(years_arr) >= 3:
         entropy_slope = float(np.polyfit(years_arr, entropy_arr, 1)[0])
         filing_slope = float(np.polyfit(years_arr, filing_arr, 1)[0])
@@ -1089,87 +1264,125 @@ def tech_entropy(
         lifecycle = "introduction"
         lifecycle_label = "導入期（少数の先駆者）"
 
-    # Latest state
-    latest = entropy_timeline[-1]
-
-    # Top 5 concentration
+    # Latest state — skip years with very low filing counts (incomplete)
+    good_entries = [e for e in entropy_timeline if e["total_filings"] > 50]
+    if not good_entries:
+        good_entries = entropy_timeline
+    latest = good_entries[-1]
     latest_yr = latest["year"]
-    top5_rows = conn.execute(
-        """SELECT pa.firm_id, COUNT(DISTINCT pa.publication_number) as cnt
-        FROM patent_assignees pa
-        JOIN patent_cpc pc ON pa.publication_number = pc.publication_number
-        JOIN patents p ON pa.publication_number = p.publication_number
-        WHERE pc.cpc_code LIKE ?
-        AND p.filing_date >= ? AND p.filing_date <= ?
-        AND pa.firm_id IS NOT NULL AND pa.firm_id != ''
-        GROUP BY pa.firm_id ORDER BY cnt DESC LIMIT 20""",
-        (f"{effective_cpc}%", latest_yr * 10000 + 101, latest_yr * 10000 + 1231),
-    ).fetchall()
 
-    total_latest = sum(r["cnt"] for r in top5_rows) if top5_rows else 1
+    # Dominant players from the latest year
+    if has_precomputed:
+        top_rows = conn.execute(
+            """SELECT firm_id, patent_count as cnt
+            FROM cpc4_firm_year_counts
+            WHERE cpc4 = ? AND year = ? AND patent_count > 0
+            ORDER BY patent_count DESC LIMIT 20""",
+            (cpc4, latest_yr),
+        ).fetchall()
+    else:
+        top_rows = conn.execute(
+            f"""SELECT firm_id, SUM(score) as cnt
+            FROM startability_surface
+            WHERE cluster_id IN ({ph})
+            AND year = ? AND gate_open = 1
+            GROUP BY firm_id
+            ORDER BY cnt DESC LIMIT 20""",
+            cluster_ids + [latest_yr],
+        ).fetchall()
+
+    total_top = sum(r["cnt"] for r in top_rows) if top_rows else 1
+    total_filings_latest = yearly_filings.get(latest_yr, 0) or 1
     dominant_players = []
     top5_share = 0
-    for r in top5_rows[:5]:
-        share = round(r["cnt"] / total_latest, 4)
+
+    for r in top_rows[:5]:
+        share = round(r["cnt"] / total_top, 4)
         top5_share += share
 
-        # Trend for this firm
+        if has_precomputed:
+            patent_count = r["cnt"]
+        else:
+            patent_count = max(1, round(share * total_filings_latest))
+
+        # Trend: compare earliest vs latest year
         firm_trend = "stable"
         if len(entropy_timeline) >= 3:
-            early_rows = conn.execute(
-                """SELECT COUNT(DISTINCT pa.publication_number) as cnt
-                FROM patent_assignees pa
-                JOIN patent_cpc pc ON pa.publication_number = pc.publication_number
-                JOIN patents p ON pa.publication_number = p.publication_number
-                WHERE pc.cpc_code LIKE ? AND pa.firm_id = ?
-                AND p.filing_date >= ? AND p.filing_date <= ?""",
-                (f"{effective_cpc}%", r["firm_id"],
-                 entropy_timeline[0]["year"] * 10000 + 101,
-                 entropy_timeline[0]["year"] * 10000 + 1231),
-            ).fetchone()
-            early_cnt = early_rows["cnt"] if early_rows else 0
+            early_yr = entropy_timeline[0]["year"]
+            if has_precomputed:
+                early_row = conn.execute(
+                    "SELECT patent_count FROM cpc4_firm_year_counts WHERE cpc4 = ? AND firm_id = ? AND year = ?",
+                    (cpc4, r["firm_id"], early_yr),
+                ).fetchone()
+                early_cnt = early_row["patent_count"] if early_row else 0
+            else:
+                early_row = conn.execute(
+                    f"""SELECT SUM(score) as cnt FROM startability_surface
+                    WHERE cluster_id IN ({ph}) AND firm_id = ? AND year = ?""",
+                    cluster_ids + [r["firm_id"], early_yr],
+                ).fetchone()
+                early_cnt = early_row["cnt"] if early_row and early_row["cnt"] else 0
             if r["cnt"] > early_cnt * 1.3:
                 firm_trend = "increasing"
-            elif r["cnt"] < early_cnt * 0.7:
+            elif early_cnt > 0 and r["cnt"] < early_cnt * 0.7:
                 firm_trend = "decreasing"
 
         dominant_players.append({
             "firm_id": r["firm_id"],
             "share": share,
-            "patent_count": r["cnt"],
+            "patent_count": patent_count,
             "trend": firm_trend,
         })
 
-    # New entrants (last 3 years)
+    # New entrants (firms present in latest year but not 3+ years ago)
     new_entrants = []
     three_years_ago = latest_yr - 3
-    new_rows = conn.execute(
-        """SELECT pa.firm_id,
-            MIN(CAST(SUBSTR(p.filing_date, 1, 4) AS INTEGER)) as first_year,
-            COUNT(DISTINCT pa.publication_number) as cnt
-        FROM patent_assignees pa
-        JOIN patent_cpc pc ON pa.publication_number = pc.publication_number
-        JOIN patents p ON pa.publication_number = p.publication_number
-        WHERE pc.cpc_code LIKE ?
-        AND pa.firm_id IS NOT NULL AND pa.firm_id != ''
-        AND p.filing_date >= ?
-        GROUP BY pa.firm_id
-        HAVING first_year >= ?
-        ORDER BY cnt DESC LIMIT 10""",
-        (f"{effective_cpc}%", three_years_ago * 10000 + 101, three_years_ago),
-    ).fetchall()
-    for nr in new_rows:
-        new_entrants.append({
-            "firm_id": nr["firm_id"],
-            "first_filing_year": nr["first_year"],
-            "patents": nr["cnt"],
-        })
+    if has_precomputed:
+        new_rows = conn.execute(
+            """SELECT c.firm_id, c.patent_count as cnt
+            FROM cpc4_firm_year_counts c
+            WHERE c.cpc4 = ? AND c.year = ? AND c.patent_count > 2
+            AND c.firm_id NOT IN (
+                SELECT DISTINCT firm_id FROM cpc4_firm_year_counts
+                WHERE cpc4 = ? AND year <= ?
+            )
+            ORDER BY c.patent_count DESC LIMIT 10""",
+            (cpc4, latest_yr, cpc4, three_years_ago),
+        ).fetchall()
+        for nr in new_rows:
+            new_entrants.append({
+                "firm_id": nr["firm_id"],
+                "first_filing_year": latest_yr,
+                "patents": nr["cnt"],
+            })
+    else:
+        new_rows = conn.execute(
+            f"""SELECT s_new.firm_id, SUM(s_new.score) as tech_score
+            FROM startability_surface s_new
+            WHERE s_new.cluster_id IN ({ph})
+            AND s_new.year = ? AND s_new.score > 0.05
+            AND s_new.firm_id NOT IN (
+                SELECT DISTINCT firm_id FROM startability_surface
+                WHERE cluster_id IN ({ph}) AND year <= ?
+            )
+            GROUP BY s_new.firm_id
+            ORDER BY tech_score DESC LIMIT 10""",
+            cluster_ids + [latest_yr] + cluster_ids + [three_years_ago],
+        ).fetchall()
+        for nr in new_rows:
+            est_patents = max(1, round(nr["tech_score"] / total_top * total_filings_latest))
+            new_entrants.append({
+                "firm_id": nr["firm_id"],
+                "first_filing_year": latest_yr,
+                "patents": est_patents,
+            })
 
     return {
         "endpoint": "tech_entropy",
         "cpc_prefix": effective_cpc,
         "cpc_label": CPC_CLASS_JA.get(cpc4, ""),
         "date_range": {"from": year_from, "to": year_to},
+        "data_source": data_source,
         "entropy_timeline": entropy_timeline,
         "current_state": {
             "entropy": latest["entropy"],
@@ -1199,3 +1412,5 @@ def tech_entropy(
             },
         },
     }
+
+

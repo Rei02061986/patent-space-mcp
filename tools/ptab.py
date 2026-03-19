@@ -63,7 +63,7 @@ def _resolve_firm(resolver: EntityResolver | None, name: str) -> dict[str, Any]:
     result = resolver.resolve(name)
     if result:
         return {
-            "firm_id": result.entity.entity_id,
+            "firm_id": result.entity.canonical_id,
             "canonical_name": result.entity.canonical_name,
             "confidence": result.confidence,
         }
@@ -309,31 +309,37 @@ def ptab_risk(
     if cpc_prefix:
         prefix = cpc_prefix.strip().upper()
         try:
-            # Total patents in this CPC area
-            total_patents = _safe_count(
-                conn,
-                "SELECT COUNT(DISTINCT publication_number) FROM patent_cpc "
-                "WHERE cpc_code LIKE ? || '%'",
-                [prefix],
-            )
+            # Total patents — fast path via tech_clusters (pre-computed)
+            tc_row = conn.execute(
+                "SELECT SUM(patent_count) as total FROM tech_clusters "
+                "WHERE cpc_class = ?",
+                (prefix[:4],),
+            ).fetchone()
+            if tc_row and tc_row["total"] and tc_row["total"] > 0:
+                total_patents = tc_row["total"]
+            else:
+                total_patents = _safe_count(
+                    conn,
+                    "SELECT COUNT(DISTINCT publication_number) FROM patent_cpc "
+                    "WHERE cpc_code LIKE ? || '%'",
+                    [prefix],
+                )
 
             # PTAB trials are US patents with bare patent_number (e.g. "7790869").
-            # publication_number in ptab_trials is typically NULL.
-            # Match by building US publication numbers from patent_number:
-            #   US-{patent_number}-B1 or US-{patent_number}-B2
-            # Then join to patent_cpc.
-            challenged = conn.execute(
-                "SELECT COUNT(DISTINCT pt.patent_number) AS cnt "
-                "FROM ptab_trials pt "
-                "WHERE EXISTS ("
-                "  SELECT 1 FROM patent_cpc pc "
-                "  WHERE pc.cpc_code LIKE ? || '%' "
-                "  AND (pc.publication_number = 'US-' || pt.patent_number || '-B1' "
-                "   OR  pc.publication_number = 'US-' || pt.patent_number || '-B2')"
-                ")",
-                (prefix,),
-            ).fetchone()
-            challenged_count = challenged["cnt"] if challenged else 0
+            # Use a join approach with LIMIT for speed
+            try:
+                challenged = conn.execute(
+                    "SELECT COUNT(DISTINCT pt.patent_number) AS cnt "
+                    "FROM ptab_trials pt "
+                    "JOIN patent_cpc pc ON ("
+                    "  pc.publication_number = 'US-' || pt.patent_number || '-B1' "
+                    "  OR pc.publication_number = 'US-' || pt.patent_number || '-B2'"
+                    ") WHERE pc.cpc_code LIKE ? || '%'",
+                    (prefix,),
+                ).fetchone()
+                challenged_count = challenged["cnt"] if challenged else 0
+            except sqlite3.OperationalError:
+                challenged_count = 0
 
             # If no matches via publication_number format, fall back to
             # counting ALL ptab_trials as a universe estimate
@@ -346,14 +352,21 @@ def ptab_risk(
                     [],
                 )
                 if total_us > 0:
-                    us_in_cpc = _safe_count(
+                    # Use tech_clusters estimate for US patents in CPC
+                    us_tc_row = conn.execute(
+                        "SELECT SUM(patent_count) as total FROM tech_clusters "
+                        "WHERE cpc_class = ?",
+                        (prefix[:4],),
+                    ).fetchone()
+                    us_in_cpc = (us_tc_row["total"] // 3 if us_tc_row and us_tc_row["total"]
+                                 else _safe_count(
                         conn,
                         "SELECT COUNT(DISTINCT pc.publication_number) FROM patent_cpc pc "
                         "JOIN patents p ON pc.publication_number = p.publication_number "
                         "WHERE pc.cpc_code LIKE ? || '%' AND p.country_code = 'US' "
                         "LIMIT 1",
                         [prefix],
-                    )
+                    ))
                     # Use proportional estimate
                     challenged_count = int(total_ptab * us_in_cpc / total_us) if total_us > 0 else 0
 

@@ -8,6 +8,8 @@ tech_clusters) for fast-path queries on spinning-disk SQLite.
 """
 from __future__ import annotations
 
+import sqlite3
+
 from collections import defaultdict
 from typing import Any
 
@@ -48,7 +50,7 @@ def _resolve_firm(resolver: EntityResolver | None, name: str) -> tuple[str | Non
     """Resolve a firm name. Returns (firm_id, display_name)."""
     if resolver is None:
         return None, name
-    resolved = resolver.resolve(name, country_hint="JP")
+    resolved = resolver.resolve(name)
     if resolved is None:
         return None, name
     return resolved.entity.canonical_id, resolved.entity.canonical_name
@@ -106,44 +108,72 @@ def tech_map(
 
             firm_patent_count = row["patent_count"] if row else 0
 
-            # Get CPC distribution from patent_assignees + patent_cpc
-            # Limit to indexed column (firm_id) for speed on HDD
-            cpc_rows = conn.execute(
+            # FAST PATH: use startability_surface + tech_clusters (pre-computed)
+            ss_rows = conn.execute(
                 """
-                SELECT c.cpc_code, COUNT(*) AS cnt
-                FROM patent_assignees a
-                JOIN patent_cpc c ON a.publication_number = c.publication_number
-                WHERE a.firm_id = ?
-                  AND c.is_first = 1
-                GROUP BY c.cpc_code
-                ORDER BY cnt DESC
+                SELECT tc.cpc_class, SUM(ss.score) as total_score,
+                       COUNT(*) as cluster_count
+                FROM startability_surface ss
+                JOIN tech_clusters tc ON ss.cluster_id = tc.cluster_id
+                WHERE ss.firm_id = ?
+                  AND ss.year = (
+                      SELECT MAX(year) FROM startability_surface
+                      WHERE firm_id = ? AND year IN (
+                          SELECT year FROM startability_surface
+                          GROUP BY year HAVING COUNT(*) > 1000
+                      )
+                  )
+                GROUP BY tc.cpc_class
+                ORDER BY total_score DESC
                 LIMIT ?
                 """,
-                (firm_id, max_nodes - 1),
+                (firm_id, firm_id, max_nodes - 1),
             ).fetchall()
 
-            if not cpc_rows:
-                # Fallback: try harmonized_name LIKE
+            if ss_rows:
+                total_score = sum(s["total_score"] for s in ss_rows) or 1
+                cpc_agg: dict[str, int] = {}
+                for sr in ss_rows:
+                    c4 = _cpc4(sr["cpc_class"]) if sr["cpc_class"] else None
+                    if c4:
+                        cnt = max(int(firm_patent_count * sr["total_score"] / total_score), sr["cluster_count"])
+                        cpc_agg[c4] = cpc_agg.get(c4, 0) + cnt
+            else:
+                # Fallback: original query
                 cpc_rows = conn.execute(
                     """
                     SELECT c.cpc_code, COUNT(*) AS cnt
                     FROM patent_assignees a
                     JOIN patent_cpc c ON a.publication_number = c.publication_number
-                    WHERE a.harmonized_name LIKE ?
+                    WHERE a.firm_id = ?
                       AND c.is_first = 1
                     GROUP BY c.cpc_code
                     ORDER BY cnt DESC
                     LIMIT ?
                     """,
-                    (f"%{firm_query}%", max_nodes - 1),
+                    (firm_id, max_nodes - 1),
                 ).fetchall()
 
-            # Aggregate to 4-char CPC subclass
-            cpc_agg: dict[str, int] = defaultdict(int)
-            for r in cpc_rows:
-                c4 = _cpc4(r["cpc_code"])
-                if c4:
-                    cpc_agg[c4] += r["cnt"]
+                if not cpc_rows:
+                    cpc_rows = conn.execute(
+                        """
+                        SELECT c.cpc_code, COUNT(*) AS cnt
+                        FROM patent_assignees a
+                        JOIN patent_cpc c ON a.publication_number = c.publication_number
+                        WHERE a.harmonized_name LIKE ?
+                          AND c.is_first = 1
+                        GROUP BY c.cpc_code
+                        ORDER BY cnt DESC
+                        LIMIT ?
+                        """,
+                        (f"%{firm_query}%", max_nodes - 1),
+                    ).fetchall()
+
+                cpc_agg = {}
+                for r in cpc_rows:
+                    c4 = _cpc4(r["cpc_code"])
+                    if c4:
+                        cpc_agg[c4] = cpc_agg.get(c4, 0) + r["cnt"]
 
             # Sort and limit
             sorted_cpcs = sorted(cpc_agg.items(), key=lambda x: x[1], reverse=True)
@@ -194,18 +224,38 @@ def tech_map(
         half_nodes = max_nodes // 2
 
         # Top sub-CPC areas under this prefix
-        sub_rows = conn.execute(
-            """
-            SELECT cpc_code, COUNT(*) AS cnt
-            FROM patent_cpc
-            WHERE cpc_code LIKE ?
-              AND is_first = 1
-            GROUP BY SUBSTR(cpc_code, 1, 4)
-            ORDER BY cnt DESC
-            LIMIT ?
-            """,
-            (f"{prefix}%", half_nodes),
-        ).fetchall()
+        # Fast path: use tech_clusters if available
+        try:
+            tc_rows = conn.execute(
+                "SELECT cpc_class, SUM(patent_count) as cnt "
+                "FROM tech_clusters WHERE cpc_class LIKE ? || '%' "
+                "GROUP BY cpc_class ORDER BY cnt DESC LIMIT ?",
+                (prefix, half_nodes),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            tc_rows = []
+
+        if tc_rows:
+            sub_rows = [{"cpc_code": r["cpc_class"], "cnt": r["cnt"]} for r in tc_rows]
+        else:
+            try:
+                sub_rows = conn.execute(
+                    """
+                    SELECT cpc_code, COUNT(*) AS cnt
+                    FROM patent_cpc
+                    WHERE cpc_code LIKE ?
+                      AND is_first = 1
+                    GROUP BY SUBSTR(cpc_code, 1, 4)
+                    ORDER BY cnt DESC
+                    LIMIT ?
+                    """,
+                    (f"{prefix}%", half_nodes),
+                ).fetchall()
+            except sqlite3.OperationalError as e:
+                if "interrupt" in str(e).lower():
+                    sub_rows = []
+                else:
+                    raise
 
         cpc_ids: list[str] = []
         for r in sub_rows:
@@ -222,19 +272,38 @@ def tech_map(
                 cpc_ids.append(c4)
 
         # Top applicants in this CPC prefix
-        applicant_rows = conn.execute(
-            """
-            SELECT a.harmonized_name, a.firm_id, COUNT(*) AS cnt
-            FROM patent_cpc c
-            JOIN patent_assignees a ON c.publication_number = a.publication_number
-            WHERE c.cpc_code LIKE ?
-              AND c.is_first = 1
-            GROUP BY COALESCE(a.firm_id, a.harmonized_name)
-            ORDER BY cnt DESC
-            LIMIT ?
-            """,
-            (f"{prefix}%", half_nodes),
-        ).fetchall()
+        try:
+            applicant_rows = conn.execute(
+                """
+                SELECT a.harmonized_name, a.firm_id, COUNT(*) AS cnt
+                FROM patent_cpc c
+                JOIN patent_assignees a ON c.publication_number = a.publication_number
+                WHERE c.cpc_code LIKE ?
+                  AND c.is_first = 1
+                GROUP BY COALESCE(a.firm_id, a.harmonized_name)
+                ORDER BY cnt DESC
+                LIMIT ?
+                """,
+                (f"{prefix}%", half_nodes),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            if "interrupt" in str(e).lower():
+                # Use startability_surface for top firms as fallback
+                try:
+                    ss_rows = conn.execute(
+                        "SELECT DISTINCT firm_id FROM startability_surface "
+                        "WHERE cluster_id LIKE ? || '%' AND gate_open = 1 "
+                        "ORDER BY score DESC LIMIT ?",
+                        (prefix[:4], half_nodes),
+                    ).fetchall()
+                    applicant_rows = [
+                        {"harmonized_name": r["firm_id"], "firm_id": r["firm_id"], "cnt": 0}
+                        for r in ss_rows
+                    ]
+                except sqlite3.OperationalError:
+                    applicant_rows = []
+            else:
+                raise
 
         # Build edges: firm -> CPC (simplified: link each firm to the prefix)
         for ar in applicant_rows:
@@ -421,7 +490,7 @@ def citation_graph_viz(
 
     # Verify seed exists
     seed_row = conn.execute(
-        "SELECT publication_number, title FROM patents WHERE publication_number = ?",
+        "SELECT publication_number, title_en FROM patents WHERE publication_number = ?",
         (seed,),
     ).fetchone()
     if not seed_row:
@@ -512,7 +581,7 @@ def citation_graph_viz(
     return {
         "endpoint": "citation_graph_viz",
         "seed": seed,
-        "seed_title": (seed_row["title"] or "")[:80],
+        "seed_title": (seed_row["title_en"] or "")[:80],
         "node_count": len(nodes),
         "edge_count": len(edges),
         "depth": depth,
@@ -535,13 +604,13 @@ def _batch_patent_meta(
         chunk = pub_ids[i:i + chunk_size]
         ph = ",".join("?" for _ in chunk)
         rows = conn.execute(
-            f"SELECT publication_number, title, filing_date "
+            f"SELECT publication_number, title_en, filing_date "
             f"FROM patents WHERE publication_number IN ({ph})",
             chunk,
         ).fetchall()
         for r in rows:
             result[r["publication_number"]] = {
-                "title": r["title"],
+                "title": r["title_en"],
                 "filing_date": str(r["filing_date"]) if r["filing_date"] else None,
             }
     return result

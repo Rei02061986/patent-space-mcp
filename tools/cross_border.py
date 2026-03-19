@@ -7,6 +7,8 @@ populated).
 """
 from __future__ import annotations
 
+import sqlite3
+
 from typing import Any
 
 from db.sqlite_store import PatentStore
@@ -136,6 +138,8 @@ def cross_border_similarity(
     top_n: int = 20,
 ) -> dict[str, Any]:
     """Find similar patent filings across jurisdictions."""
+    import time as _time
+    _cb_deadline = _time.monotonic() + 50  # 50s time budget
     store._relax_timeout()
 
     if target_jurisdictions is None:
@@ -222,26 +226,42 @@ def cross_border_similarity(
         }
 
     # Search for similar patents
-    raw_results = _search_similar_by_cpc(
-        conn, cpc_codes, target_jurisdictions,
-        exclude_pub=exclude_pub,
-        time_ref=time_ref,
-        time_window=time_window,
-        top_n=top_n * 2,
-    )
+    try:
+        raw_results = _search_similar_by_cpc(
+            conn, cpc_codes, target_jurisdictions,
+            exclude_pub=exclude_pub,
+            time_ref=time_ref,
+            time_window=time_window,
+            top_n=top_n * 2,
+        )
+    except sqlite3.OperationalError as e:
+        if "interrupt" in str(e).lower():
+            return {
+                "endpoint": "cross_border_similarity",
+                "source": source_info,
+                "similar_filings": [],
+                "summary": {"total_found": 0},
+                "note": "Query timed out during cross-border patent search. Try fewer CPC codes or jurisdictions.",
+            }
+        raise
 
     # Enrich results
     similar_filings = []
     by_jurisdiction: dict[str, int] = {}
 
-    for r in raw_results:
+    for _ri, r in enumerate(raw_results):
+        if _time.monotonic() > _cb_deadline:
+            break  # time budget exceeded
         pub_num = r.get("publication_number", "")
         country = r.get("country_code", "")
         filing_date = r.get("filing_date")
         family_id = r.get("family_id")
 
         # CPC overlap calculation
-        result_cpc = _get_patent_cpc(conn, pub_num)
+        try:
+            result_cpc = _get_patent_cpc(conn, pub_num)
+        except sqlite3.OperationalError:
+            result_cpc = []
         source_cpc_set = set(cpc_codes)
         result_cpc_set = set(result_cpc)
         cpc_overlap = (
@@ -268,12 +288,15 @@ def cross_border_similarity(
         )
 
         # Get assignee
-        assignee_row = conn.execute(
-            "SELECT harmonized_name FROM patent_assignees "
-            "WHERE publication_number = ? LIMIT 1",
-            (pub_num,),
-        ).fetchone()
-        applicant = assignee_row["harmonized_name"] if assignee_row else None
+        try:
+            assignee_row = conn.execute(
+                "SELECT harmonized_name FROM patent_assignees "
+                "WHERE publication_number = ? LIMIT 1",
+                (pub_num,),
+            ).fetchone()
+            applicant = assignee_row["harmonized_name"] if assignee_row else None
+        except sqlite3.OperationalError:
+            applicant = None
 
         # Similarity score (CPC-based)
         similarity_score = round(cpc_overlap, 3)

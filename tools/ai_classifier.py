@@ -17,6 +17,7 @@ import sqlite3
 from typing import Any
 
 from db.sqlite_store import PatentStore, _sanitize_fts5
+import time as _time
 from entity.resolver import EntityResolver
 from tools.pagination import paginate
 

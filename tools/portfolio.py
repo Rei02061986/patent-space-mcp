@@ -7,6 +7,19 @@ from db.sqlite_store import PatentStore
 from entity.resolver import EntityResolver
 
 
+# Mapping: entity canonical_id → patent_assignees firm_id
+# These differ because patent_assignees uses Google Patents harmonization
+# while entity registry uses our own canonical IDs.
+_PORTFOLIO_FIRM_REMAP = {
+    "samsung": "samsung_electronics",
+    "bosch": "bosch_robert",
+    "huawei": "huawei_tech",
+    "lg": "lg_electronics",
+    "siemens": "siemens_ag",
+    "byd": "byd_co",
+}
+
+
 def firm_patent_portfolio(
     store: PatentStore,
     resolver: EntityResolver,
@@ -28,8 +41,10 @@ def firm_patent_portfolio(
 
     # Get portfolio from SQLite
     date_to = int(date.replace("-", "")) if date else None
+    # Remap canonical_id to actual patent_assignees firm_id if needed
+    portfolio_firm_id = _PORTFOLIO_FIRM_REMAP.get(entity.canonical_id, entity.canonical_id)
     portfolio = store.get_firm_portfolio(
-        firm_id=entity.canonical_id,
+        firm_id=portfolio_firm_id,
         date_to=date_to,
     )
 
@@ -37,7 +52,7 @@ def firm_patent_portfolio(
     if detail_patents and portfolio["count"] <= 1000:
         with store._conn() as conn:
             date_cond = " AND p.publication_date <= ?" if date_to else ""
-            params: list[Any] = [entity.canonical_id]
+            params: list[Any] = [portfolio_firm_id]
             if date_to:
                 params.append(date_to)
             rows = conn.execute(

@@ -78,6 +78,16 @@ class PatentStore:
                 raise
         finally:
             self._reset_timeout()
+            # Close and discard the init connection so queries get a fresh one.
+            # executescript(SCHEMA_SQL) can leave stale FTS5 virtual table
+            # metadata that causes "database disk image is malformed" errors.
+            old_conn = getattr(self._local, "conn", None)
+            if old_conn is not None:
+                try:
+                    old_conn.close()
+                except Exception:
+                    pass
+                self._local.conn = None
 
     def _conn(self) -> sqlite3.Connection:
         """Return a persistent per-thread connection (PRAGMAs run once).
@@ -306,6 +316,7 @@ class PatentStore:
         date_from: int | None = None,
         date_to: int | None = None,
         limit: int = 20,
+        country_code: str | None = None,
     ) -> list[dict[str, Any]]:
         """Search patents using FTS5 and/or filters."""
         conditions = []
@@ -314,11 +325,29 @@ class PatentStore:
         if query:
             safe_query = _sanitize_fts5(query)
             if safe_query:
-                conditions.append(
-                    "p.publication_number IN "
-                    "(SELECT publication_number FROM patents_fts WHERE patents_fts MATCH ?)"
-                )
-                params.append(safe_query)
+                # FTS5 with DatabaseError fallback to LIKE
+                try:
+                    _fts_pubs = [r[0] for r in self._conn().execute(
+                        "SELECT publication_number FROM patents_fts "
+                        "WHERE patents_fts MATCH ? LIMIT 5000", (safe_query,)
+                    ).fetchall()]
+                    if _fts_pubs:
+                        _ph = ",".join("?" * len(_fts_pubs))
+                        conditions.append(f"p.publication_number IN ({_ph})")
+                        params.extend(_fts_pubs)
+                    else:
+                        conditions.append("0")
+                except (sqlite3.DatabaseError, sqlite3.OperationalError):
+                    # FTS5 corrupt — fall back to LIKE on title
+                    _words = [w.strip('"') for w in safe_query.split() if len(w.strip('"')) >= 3]
+                    if _words:
+                        _like_parts = []
+                        for _w in _words[:4]:
+                            _like_parts.append(
+                                "(p.title_ja LIKE '%' || ? || '%' OR p.title_en LIKE '%' || ? || '%')"
+                            )
+                            params.extend([_w, _w])
+                        conditions.append("(" + " AND ".join(_like_parts) + ")")
             elif _has_short_words(query):
                 # Trigram can't match words < 3 chars — fall back to LIKE
                 q_clean = re.sub(r"[^\w\u3000-\u9fff\uff00-\uffef]", "", query.strip())
@@ -360,6 +389,10 @@ class PatentStore:
             conditions.append("p.publication_date <= ?")
             params.append(date_to)
 
+        if country_code:
+            conditions.append("p.country_code = ?")
+            params.append(country_code)
+
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
 
         sql = f"""
@@ -378,10 +411,13 @@ class PatentStore:
         conn = self._conn()
         try:
             rows = conn.execute(sql, params).fetchall()
-        except sqlite3.OperationalError as e:
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
             if "interrupted" in str(e):
                 _log.warning(f"Search query timed out after {_QUERY_TIMEOUT}s")
                 raise  # Let _safe_call handle it
+            if "malformed" in str(e):
+                _log.warning(f"DB corruption detected in search: {e}")
+                return []
             raise
 
         if not rows:
@@ -436,6 +472,7 @@ class PatentStore:
         assignee: str | None = None,
         date_from: int | None = None,
         date_to: int | None = None,
+        country_code: str | None = None,
     ) -> int:
         """Count matching patents."""
         conditions = []
@@ -444,11 +481,29 @@ class PatentStore:
         if query:
             safe_query = _sanitize_fts5(query)
             if safe_query:
-                conditions.append(
-                    "p.publication_number IN "
-                    "(SELECT publication_number FROM patents_fts WHERE patents_fts MATCH ?)"
-                )
-                params.append(safe_query)
+                # FTS5 with DatabaseError fallback to LIKE
+                try:
+                    _fts_pubs = [r[0] for r in self._conn().execute(
+                        "SELECT publication_number FROM patents_fts "
+                        "WHERE patents_fts MATCH ? LIMIT 5000", (safe_query,)
+                    ).fetchall()]
+                    if _fts_pubs:
+                        _ph = ",".join("?" * len(_fts_pubs))
+                        conditions.append(f"p.publication_number IN ({_ph})")
+                        params.extend(_fts_pubs)
+                    else:
+                        conditions.append("0")
+                except (sqlite3.DatabaseError, sqlite3.OperationalError):
+                    # FTS5 corrupt — fall back to LIKE on title
+                    _words = [w.strip('"') for w in safe_query.split() if len(w.strip('"')) >= 3]
+                    if _words:
+                        _like_parts = []
+                        for _w in _words[:4]:
+                            _like_parts.append(
+                                "(p.title_ja LIKE '%' || ? || '%' OR p.title_en LIKE '%' || ? || '%')"
+                            )
+                            params.extend([_w, _w])
+                        conditions.append("(" + " AND ".join(_like_parts) + ")")
             elif _has_short_words(query):
                 # LIKE-based count on 13M+ rows is too slow — return -1
                 # to signal "unknown total" to the caller
@@ -477,6 +532,10 @@ class PatentStore:
         if date_to:
             conditions.append("p.publication_date <= ?")
             params.append(date_to)
+
+        if country_code:
+            conditions.append("p.country_code = ?")
+            params.append(country_code)
 
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
 
@@ -696,11 +755,29 @@ class PatentStore:
         if query:
             safe_query = _sanitize_fts5(query)
             if safe_query:
-                conditions.append(
-                    "p.publication_number IN "
-                    "(SELECT publication_number FROM patents_fts WHERE patents_fts MATCH ?)"
-                )
-                params.append(safe_query)
+                # FTS5 with DatabaseError fallback to LIKE
+                try:
+                    _fts_pubs = [r[0] for r in self._conn().execute(
+                        "SELECT publication_number FROM patents_fts "
+                        "WHERE patents_fts MATCH ? LIMIT 5000", (safe_query,)
+                    ).fetchall()]
+                    if _fts_pubs:
+                        _ph = ",".join("?" * len(_fts_pubs))
+                        conditions.append(f"p.publication_number IN ({_ph})")
+                        params.extend(_fts_pubs)
+                    else:
+                        conditions.append("0")
+                except (sqlite3.DatabaseError, sqlite3.OperationalError):
+                    # FTS5 corrupt — fall back to LIKE on title
+                    _words = [w.strip('"') for w in safe_query.split() if len(w.strip('"')) >= 3]
+                    if _words:
+                        _like_parts = []
+                        for _w in _words[:4]:
+                            _like_parts.append(
+                                "(p.title_ja LIKE '%' || ? || '%' OR p.title_en LIKE '%' || ? || '%')"
+                            )
+                            params.extend([_w, _w])
+                        conditions.append("(" + " AND ".join(_like_parts) + ")")
             elif _has_short_words(query):
                 q_clean = re.sub(r"[^\w\u3000-\u9fff\uff00-\uffef]", "", query.strip())
                 if q_clean:
@@ -774,11 +851,29 @@ class PatentStore:
         if query:
             safe_query = _sanitize_fts5(query)
             if safe_query:
-                conditions.append(
-                    "p.publication_number IN "
-                    "(SELECT publication_number FROM patents_fts WHERE patents_fts MATCH ?)"
-                )
-                params.append(safe_query)
+                # FTS5 with DatabaseError fallback to LIKE
+                try:
+                    _fts_pubs = [r[0] for r in self._conn().execute(
+                        "SELECT publication_number FROM patents_fts "
+                        "WHERE patents_fts MATCH ? LIMIT 5000", (safe_query,)
+                    ).fetchall()]
+                    if _fts_pubs:
+                        _ph = ",".join("?" * len(_fts_pubs))
+                        conditions.append(f"p.publication_number IN ({_ph})")
+                        params.extend(_fts_pubs)
+                    else:
+                        conditions.append("0")
+                except (sqlite3.DatabaseError, sqlite3.OperationalError):
+                    # FTS5 corrupt — fall back to LIKE on title
+                    _words = [w.strip('"') for w in safe_query.split() if len(w.strip('"')) >= 3]
+                    if _words:
+                        _like_parts = []
+                        for _w in _words[:4]:
+                            _like_parts.append(
+                                "(p.title_ja LIKE '%' || ? || '%' OR p.title_en LIKE '%' || ? || '%')"
+                            )
+                            params.extend([_w, _w])
+                        conditions.append("(" + " AND ".join(_like_parts) + ")")
             elif _has_short_words(query):
                 q_clean = re.sub(r"[^\w\u3000-\u9fff\uff00-\uffef]", "", query.strip())
                 if q_clean:
@@ -826,51 +921,84 @@ class PatentStore:
         firm_id: str,
         min_count: int = 5,
     ) -> list[dict[str, Any]]:
-        """Find co-applicant entities and shared technology classes."""
+        """Find co-applicant entities and shared technology classes.
+
+        Optimized: 2-step query (no CPC join in self-join) + firm_tech_vectors
+        for shared CPC lookup.
+        """
         with self._conn() as conn:
             try:
+                # Step 1: co-assignees WITHOUT CPC join (much faster)
                 rows = conn.execute(
                     """SELECT
                            COALESCE(a2.firm_id, '__name__:' || COALESCE(a2.harmonized_name, a2.raw_name)) as co_id,
                            COALESCE(a2.harmonized_name, a2.raw_name) as co_name,
                            a2.firm_id as co_firm_id,
-                           COUNT(DISTINCT a1.publication_number) as co_patent_count,
-                           GROUP_CONCAT(DISTINCT substr(c.cpc_code, 1, 4)) as shared_cpc
+                           COUNT(DISTINCT a1.publication_number) as co_patent_count
                        FROM patent_assignees a1
                        JOIN patent_assignees a2
                          ON a1.publication_number = a2.publication_number
                         AND a1.id != a2.id
-                       LEFT JOIN patent_cpc c
-                         ON a1.publication_number = c.publication_number
                        WHERE a1.firm_id = ?
                          AND COALESCE(a2.harmonized_name, a2.raw_name) IS NOT NULL
                          AND (a2.firm_id IS NULL OR a2.firm_id != ?)
                        GROUP BY co_id, co_name, co_firm_id
                        HAVING co_patent_count >= ?
-                       ORDER BY co_patent_count DESC""",
+                       ORDER BY co_patent_count DESC
+                       LIMIT 100""",
                     (firm_id, firm_id, min_count),
                 ).fetchall()
             except sqlite3.OperationalError as e:
                 if "interrupted" in str(e):
                     _log.warning(f"Co-applicant network query timed out after {_QUERY_TIMEOUT}s")
-                    raise  # Let _safe_call handle it
+                    raise
                 raise
+
+            # Step 2: get shared CPC from firm_tech_vectors (instant)
+            src_cpc = None
+            src_row = conn.execute(
+                "SELECT dominant_cpc FROM firm_tech_vectors "
+                "WHERE firm_id = ? ORDER BY year DESC LIMIT 1",
+                (firm_id,),
+            ).fetchone()
+            if src_row:
+                src_cpc = src_row["dominant_cpc"]
 
         network = []
         for r in rows:
             shared_cpc = []
-            if r["shared_cpc"]:
-                shared_cpc = sorted(r["shared_cpc"].split(","))
+            co_fid = r["co_firm_id"]
+            if co_fid:
+                with self._conn() as conn2:
+                    ftv = conn2.execute(
+                        "SELECT dominant_cpc FROM firm_tech_vectors "
+                        "WHERE firm_id = ? ORDER BY year DESC LIMIT 1",
+                        (co_fid,),
+                    ).fetchone()
+                    if ftv and ftv["dominant_cpc"]:
+                        shared_cpc.append(ftv["dominant_cpc"])
+                    if src_cpc and src_cpc not in shared_cpc:
+                        shared_cpc.append(src_cpc)
             network.append(
                 {
                     "co_id": r["co_id"],
                     "co_name": r["co_name"],
                     "co_firm_id": r["co_firm_id"],
                     "co_patent_count": r["co_patent_count"],
-                    "shared_cpc_classes": shared_cpc,
+                    "shared_cpc_classes": sorted(shared_cpc),
                 }
             )
         return network
+
+    def get_firm_patent_count_fast(self, firm_id: str) -> int | None:
+        """Get patent count from pre-computed firm_tech_vectors (instant)."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT patent_count FROM firm_tech_vectors "
+                "WHERE firm_id = ? ORDER BY year DESC LIMIT 1",
+                (firm_id,),
+            ).fetchone()
+            return row["patent_count"] if row else None
 
     def log_ingestion_start(
         self, batch_id: str, source: str, country_code: str

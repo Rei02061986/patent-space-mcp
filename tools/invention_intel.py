@@ -71,6 +71,25 @@ _JP_EN_MAP = {
 }
 
 
+def _sanitize_for_json(obj):
+    """Recursively convert numpy types to Python natives for JSON serialization."""
+    try:
+        import numpy as np
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+    except ImportError:
+        pass
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_sanitize_for_json(v) for v in obj)
+    return obj
+
+
 def _is_english(text: str) -> bool:
     """Heuristic: text is mostly ASCII = English."""
     ascii_count = sum(1 for c in text if ord(c) < 128)
@@ -419,7 +438,7 @@ def _find_whitespace(
             SELECT cluster_id, growth_rate
             FROM tech_cluster_momentum
             WHERE cluster_id IN ({ph})
-              AND year = (SELECT MAX(year) FROM tech_cluster_momentum)
+              AND year = (SELECT year FROM tech_cluster_momentum GROUP BY year HAVING AVG(growth_rate) > -0.3 ORDER BY year DESC LIMIT 1)
             """,
             candidate_ids,
         ).fetchall()
@@ -562,7 +581,7 @@ def invention_intelligence(
             FROM tech_clusters tc
             LEFT JOIN tech_cluster_momentum tcm
                 ON tc.cluster_id = tcm.cluster_id
-                AND tcm.year = (SELECT MAX(year) FROM tech_cluster_momentum)
+                AND tcm.year = (SELECT year FROM tech_cluster_momentum GROUP BY year HAVING AVG(growth_rate) > -0.3 ORDER BY year DESC LIMIT 1)
             WHERE tc.cluster_id = ?
             """,
             (primary_cluster_id,),
@@ -664,4 +683,4 @@ def invention_intelligence(
     if prior_art_note:
         result["prior_art"]["note"] = prior_art_note
 
-    return result
+    return _sanitize_for_json(result)

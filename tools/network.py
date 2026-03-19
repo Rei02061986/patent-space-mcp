@@ -9,6 +9,16 @@ from entity.resolver import EntityResolver
 from tools.pagination import paginate
 
 
+# Mapping: entity canonical_id -> patent_assignees firm_id
+_NETWORK_FIRM_REMAP = {
+    "samsung": "samsung_electronics",
+    "bosch": "bosch_robert",
+    "huawei": "huawei_tech",
+    "lg": "lg_electronics",
+    "siemens": "siemens_ag",
+    "byd": "byd_co",
+}
+
 def applicant_network(
     store: PatentStore,
     resolver: EntityResolver,
@@ -27,12 +37,15 @@ def applicant_network(
         }
 
     entity = result.entity
-    center_count = store.get_firm_portfolio(firm_id=entity.canonical_id)["count"]
+    # Remap canonical_id to actual patent_assignees firm_id
+    _effective_firm_id = _NETWORK_FIRM_REMAP.get(entity.canonical_id, entity.canonical_id)
+
+    center_count = store.get_firm_patent_count_fast(_effective_firm_id) or 0
 
     depth = max(1, depth)
     min_co_patents = max(1, min_co_patents)
 
-    queue: list[tuple[str, int]] = [(entity.canonical_id, 0)]
+    queue: list[tuple[str, int]] = [(_effective_firm_id, 0)]
     expanded: set[str] = set()
     node_map: dict[str, dict[str, Any]] = {}
     edge_map: dict[tuple[str, str], dict[str, Any]] = {}
@@ -50,15 +63,15 @@ def applicant_network(
 
         for row in neighbors:
             target_id = row["co_firm_id"] or row["co_id"]
-            if not target_id or target_id == entity.canonical_id:
+            if not target_id or target_id == _effective_firm_id:
                 continue
 
             if target_id not in node_map:
                 patent_count = row["co_patent_count"]
                 if row["co_firm_id"]:
-                    patent_count = store.get_firm_portfolio(
-                        firm_id=row["co_firm_id"]
-                    )["count"]
+                    fast_count = store.get_firm_patent_count_fast(row["co_firm_id"])
+                    if fast_count is not None:
+                        patent_count = fast_count
                 node_map[target_id] = {
                     "id": target_id,
                     "name": row["co_name"],

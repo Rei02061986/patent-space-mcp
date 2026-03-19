@@ -13,6 +13,7 @@ from typing import Any
 
 from db.sqlite_store import PatentStore, _sanitize_fts5
 from tools.pagination import paginate
+from tools.jp_tech_cpc_map import JP_TECH_CPC_MAP as _EXTENDED_JP_CPC
 
 # Common JP→EN tech term mapping for cluster label matching
 _JP_EN_MAP = {
@@ -144,6 +145,7 @@ def _search_with_multi_cpc(
     date_from_int: int | None,
     date_to_int: int | None,
     limit: int,
+    country_code: str | None = None,
 ) -> tuple[list[dict], int]:
     """Search with support for multiple CPC codes."""
     if not cpc_codes or len(cpc_codes) <= 1:
@@ -155,6 +157,7 @@ def _search_with_multi_cpc(
             date_from=date_from_int,
             date_to=date_to_int,
             limit=limit,
+            country_code=country_code,
         )
         total = store.count(
             query=query,
@@ -162,6 +165,7 @@ def _search_with_multi_cpc(
             assignee=applicant,
             date_from=date_from_int,
             date_to=date_to_int,
+            country_code=country_code,
         )
         return results, total
 
@@ -172,11 +176,28 @@ def _search_with_multi_cpc(
     if query:
         safe_q = _sanitize_fts5(query)
         if safe_q:
-            conditions.append(
-                "p.publication_number IN "
-                "(SELECT publication_number FROM patents_fts WHERE patents_fts MATCH ?)"
-            )
-            params.append(safe_q)
+            # FTS5 with DatabaseError fallback to LIKE
+            try:
+                _fts_pubs = [r[0] for r in conn.execute(
+                    "SELECT publication_number FROM patents_fts "
+                    "WHERE patents_fts MATCH ? LIMIT 5000", (safe_q,)
+                ).fetchall()]
+                if _fts_pubs:
+                    _ph = ",".join("?" * len(_fts_pubs))
+                    conditions.append(f"p.publication_number IN ({_ph})")
+                    params.extend(_fts_pubs)
+                else:
+                    conditions.append("0")
+            except (sqlite3.DatabaseError, sqlite3.OperationalError):
+                _words = [w.strip('"') for w in safe_q.split() if len(w.strip('"')) >= 3]
+                if _words:
+                    _like_parts = []
+                    for _w in _words[:4]:
+                        _like_parts.append(
+                            "(p.title_ja LIKE '%' || ? || '%' OR p.title_en LIKE '%' || ? || '%')"
+                        )
+                        params.extend([_w, _w])
+                    conditions.append("(" + " AND ".join(_like_parts) + ")")
 
     for cpc in cpc_codes:
         conditions.append(
@@ -206,6 +227,10 @@ def _search_with_multi_cpc(
     if date_to_int:
         conditions.append("p.publication_date <= ?")
         params.append(date_to_int)
+
+    if country_code:
+        conditions.append("p.country_code = ?")
+        params.append(country_code)
 
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
 
@@ -378,6 +403,7 @@ def patent_search(
             date_from_int=date_from_int,
             date_to_int=date_to_int,
             limit=limit,
+            country_code=None,  # Post-filtered (SQL too slow on HDD)
         )
     except sqlite3.OperationalError as e:
         if "interrupted" in str(e):
@@ -443,6 +469,11 @@ def patent_search(
     cluster_hint = None
     if not results and (query or cpc_codes):
         cluster_hint = _cluster_hint(store, query=query, cpc_codes=cpc_codes)
+
+    # Post-filter by jurisdiction (SQL filter on 160M rows is too slow on HDD)
+    if jurisdiction and jurisdiction != "ALL" and results:
+        results = [r for r in results if r.get("country_code") == jurisdiction]
+        total_count = len(results)  # Approximate (filtered count)
 
     paged = paginate(results, page=page, page_size=requested_page_size)
     page_size_clamped = paged["page_size"]

@@ -66,6 +66,13 @@ from tools.sep_analysis import sep_search, sep_landscape, sep_portfolio, frand_a
 from tools.corporate_hierarchy import corporate_hierarchy, group_portfolio, group_startability
 from tools.claim_analysis import claim_analysis, claim_comparison, fto_analysis
 from tools.ai_classifier import create_category, classify_patents, category_landscape, portfolio_benchmark
+from tools.monitoring import create_watch, list_watches, check_alerts, acknowledge_alerts, delete_watch, run_monitoring
+from tools.patent_summary import patent_summary, technology_brief
+from tools.visualization import tech_map, citation_graph_viz, firm_landscape, startability_heatmap
+from tools.ptab import ptab_search, ptab_risk, litigation_search, litigation_risk
+from tools.interpret import add_interpretation
+from tools.error_format import standardize_error
+from tools.meta_tools import tool_help, tool_suggest
 
 load_dotenv()
 
@@ -83,7 +90,89 @@ for _e in SP500_ENTITIES:
     _entity_registry.register(_e)
 for _e in GLOBAL_ENTITIES:
     _entity_registry.register(_e)
+
+# ── Additional global entities (Phase 2 QA improvement) ──
+from entity.registry import Entity as _Ent
+for _extra in [
+    _Ent(canonical_id="arm", canonical_name="Arm Holdings", country_code="GB",
+         entity_type="corporation", aliases={"arm", "arm holdings", "arm ltd", "arm limited", "ARM"}, industry="Semiconductor IP"),
+    _Ent(canonical_id="asml", canonical_name="ASML Holding", country_code="NL",
+         entity_type="corporation", aliases={"asml", "asml holding", "ASML"}, industry="Semiconductor Equipment"),
+    _Ent(canonical_id="infineon", canonical_name="Infineon Technologies", country_code="DE",
+         entity_type="corporation", aliases={"infineon", "infineon technologies", "インフィニオン"}, industry="Semiconductor"),
+    _Ent(canonical_id="stmicroelectronics", canonical_name="STMicroelectronics", country_code="CH",
+         entity_type="corporation", aliases={"stmicroelectronics", "stmicro", "st micro", "STM"}, industry="Semiconductor"),
+    _Ent(canonical_id="nxp", canonical_name="NXP Semiconductors", country_code="NL",
+         entity_type="corporation", aliases={"nxp", "nxp semiconductors", "NXP"}, industry="Semiconductor"),
+    _Ent(canonical_id="micron", canonical_name="Micron Technology", country_code="US",
+         entity_type="corporation", aliases={"micron", "micron technology", "マイクロン"}, industry="Memory"),
+    _Ent(canonical_id="mediatek", canonical_name="MediaTek", country_code="TW",
+         entity_type="corporation", aliases={"mediatek", "メディアテック", "聯発科"}, industry="Semiconductor"),
+    _Ent(canonical_id="renesas", canonical_name="Renesas Electronics", country_code="JP",
+         entity_type="corporation", aliases={"renesas", "renesas electronics", "ルネサス", "ルネサスエレクトロニクス"}, industry="Semiconductor"),
+    _Ent(canonical_id="rohm", canonical_name="ROHM Co.", country_code="JP",
+         entity_type="corporation", aliases={"rohm", "ローム"}, industry="Semiconductor"),
+    _Ent(canonical_id="byd", canonical_name="BYD", country_code="CN",
+         entity_type="corporation", aliases={"byd", "BYD", "比亜迪", "ビーワイディー"}, industry="EV/Battery"),
+    _Ent(canonical_id="tesla", canonical_name="Tesla", country_code="US",
+         entity_type="corporation", aliases={"tesla", "テスラ", "tesla motors", "tesla inc"}, industry="EV"),
+    _Ent(canonical_id="uber", canonical_name="Uber Technologies", country_code="US",
+         entity_type="corporation", aliases={"uber", "ウーバー", "uber technologies"}, industry="Mobility"),
+    _Ent(canonical_id="bosch", canonical_name="Robert Bosch", country_code="DE",
+         entity_type="corporation", aliases={"bosch", "ボッシュ", "robert bosch", "robert bosch gmbh"}, industry="Automotive/Industrial"),
+    _Ent(canonical_id="siemens", canonical_name="Siemens", country_code="DE",
+         entity_type="corporation", aliases={"siemens", "シーメンス", "siemens ag"}, industry="Industrial/Energy"),
+    _Ent(canonical_id="schneider_electric", canonical_name="Schneider Electric", country_code="FR",
+         entity_type="corporation", aliases={"schneider", "schneider electric", "シュナイダー"}, industry="Energy Management"),
+    _Ent(canonical_id="abbott", canonical_name="Abbott Laboratories", country_code="US",
+         entity_type="corporation", aliases={"abbott", "アボット", "abbott laboratories"}, industry="Medical Devices"),
+    _Ent(canonical_id="medtronic", canonical_name="Medtronic", country_code="IE",
+         entity_type="corporation", aliases={"medtronic", "メドトロニック"}, industry="Medical Devices"),
+    _Ent(canonical_id="roche", canonical_name="Roche", country_code="CH",
+         entity_type="corporation", aliases={"roche", "ロシュ", "roche holding"}, industry="Pharma"),
+    _Ent(canonical_id="novartis", canonical_name="Novartis", country_code="CH",
+         entity_type="corporation", aliases={"novartis", "ノバルティス"}, industry="Pharma"),
+    _Ent(canonical_id="astrazeneca", canonical_name="AstraZeneca", country_code="GB",
+         entity_type="corporation", aliases={"astrazeneca", "アストラゼネカ"}, industry="Pharma"),
+]:
+    _entity_registry.register(_extra)
+
+
+# Register additional entities (CN companies + missing global)
+from entity.registry import Entity as _Entity
+for _ent in [
+    _Entity(canonical_id="dji", canonical_name="DJI", country_code="CN",
+            entity_type="corporation", aliases={"dji", "dji technology", "sz dji technology", "shenzhen dji", "da-jiang innovations"}, industry="Drones/UAV"),
+    _Entity(canonical_id="catl", canonical_name="CATL", country_code="CN",
+            entity_type="corporation", aliases={"catl", "contemporary amperex technology", "contemporary amperex", "ningde shidai"}, industry="Battery/Energy Storage"),
+    _Entity(canonical_id="continental", canonical_name="Continental AG", country_code="DE",
+            entity_type="corporation", aliases={"continental", "continental ag", "continental automotive"}, industry="Automotive"),
+    _Entity(canonical_id="murata", canonical_name="Murata Manufacturing", country_code="JP",
+            entity_type="corporation", aliases={"murata", "murata manufacturing", "murata mfg"}, industry="Electronics"),
+]:
+    _entity_registry.register(_ent)
+
 _resolver = EntityResolver(_entity_registry)
+
+# Register aliases for merged firm_ids so entity_resolve finds canonical
+_MERGED_ALIASES = {
+    "tsmc": ["taiwan semiconductor manufacturing", "taiwan semiconductor mfg"],
+    "boeing": ["boeing co", "the boeing company"],
+    "bosch": ["bosch robert", "robert bosch"],
+    "ge": ["gen electric", "general electric co ge", "general electric"],
+    "canon": ["canon inc"],
+    "baker_hughes": ["baker hughesorporated"],
+    "corning": ["corningorporated"],
+    "dji": ["dji technology", "sz dji technology", "sz dji", "shenzhen dji", "da-jiang innovations"],
+    "catl": ["contemporary amperex technology", "contemporary amperex", "ningde shidai"],
+    "continental": ["continental ag", "continental automotive"],
+    "murata": ["murata manufacturing", "murata mfg"],
+    "byd": ["byd company", "byd co", "byd auto"],
+    "tesla": ["tesla inc", "tesla motors"],
+}
+for _cid, _aliases in _MERGED_ALIASES.items():
+    for _alias in _aliases:
+        _entity_registry.add_alias(_cid, _alias)
 
 # Load company display names from companies_master.csv
 _FIRM_DISPLAY_NAMES: dict[str, str] = {}
@@ -116,9 +205,46 @@ for _e in _entity_registry.all_entities():
     if _e.canonical_id not in _FIRM_DISPLAY_NAMES:
         _FIRM_DISPLAY_NAMES[_e.canonical_id] = _e.canonical_name
 
+# Load display names from display_names table in SQLite
+try:
+    import sqlite3 as _sqlite3
+    _dn_conn = _sqlite3.connect(
+        str(Path(__file__).resolve().parent / "data" / "patents.db"),
+        timeout=10,
+    )
+    _dn_conn.row_factory = _sqlite3.Row
+    _dn_rows = _dn_conn.execute(
+        "SELECT DISTINCT canonical_name, display_name FROM display_names"
+    ).fetchall()
+    # Build reverse map: firm_id-like key -> display_name
+    for _r in _dn_rows:
+        _cn = _r["canonical_name"] or ""
+        _dn = _r["display_name"] or _cn
+        # Generate firm_id from canonical_name (same logic as compute_global_startability)
+        _fid = _cn.lower().strip()
+        for _suffix in [
+            " co., ltd.", " co ltd", " corporation", " corp.", " corp",
+            " incorporated", " inc.", " inc", " ag", " gmbh", " ltd.", " ltd",
+            " llc", " s.a.", " plc", " aktiengesellschaft",
+            " kabushiki kaisha", " k.k.",
+        ]:
+            _fid = _fid.replace(_suffix, "")
+        _fid = _fid.replace(" ", "_").replace("-", "_").replace(".", "").replace(",", "")
+        if _fid and _fid not in _FIRM_DISPLAY_NAMES:
+            _FIRM_DISPLAY_NAMES[_fid] = _dn
+    _dn_conn.close()
+except Exception:
+    pass
+
 def _display_name(firm_id: str) -> str:
     """Resolve firm_id to human-readable display name."""
-    return _FIRM_DISPLAY_NAMES.get(firm_id, firm_id)
+    name = _FIRM_DISPLAY_NAMES.get(firm_id)
+    if name:
+        return name
+    # Fallback: titlecase from firm_id (e.g., disco_abrasive_syst -> Disco Abrasive Syst)
+    if firm_id and not firm_id.startswith("company_"):
+        return firm_id.replace("_", " ").title()
+    return firm_id
 
 def _enrich_firm_ids(result: dict | list) -> dict | list:
     """Walk a result structure and add display_name alongside firm_id fields."""
@@ -142,73 +268,91 @@ _store = PatentStore(_db_path)
 
 # ── Speed optimizations for read-heavy workload ──
 def _apply_read_pragmas():
-    """Apply SQLite PRAGMAs for read performance on NVMe."""
+    """Apply SQLite PRAGMAs for read performance on NVMe.
+
+    Container has 48GB memory — use generous cache + mmap for 614GB DB.
+    """
     try:
         conn = _store._conn()
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA cache_size=-131072")   # 128MB page cache (was default ~2MB)
-        conn.execute("PRAGMA mmap_size=4294967296")  # 4GB mmap for fast random reads
-        conn.execute("PRAGMA read_uncommitted=ON")   # Don't wait for WAL writer
-        conn.execute("PRAGMA temp_store=MEMORY")     # temp tables in RAM
-        conn.execute("PRAGMA busy_timeout=10000")    # 10s retry on locks
-        print(f"Applied read-optimized PRAGMAs (cache=128MB, mmap=4GB)")
+        conn.execute("PRAGMA cache_size=-4194304")    # 4GB page cache (48GB container)
+        conn.execute("PRAGMA mmap_size=34359738368")   # 32GB mmap for NVMe random reads
+        conn.execute("PRAGMA read_uncommitted=ON")     # Don't wait for WAL writer
+        conn.execute("PRAGMA temp_store=MEMORY")       # temp tables in RAM
+        conn.execute("PRAGMA busy_timeout=30000")      # 30s retry on locks
+        conn.execute("PRAGMA threads=6")               # Parallel sorting (6-core CPU)
+        conn.execute("PRAGMA wal_autocheckpoint=0")    # Disable auto-checkpoint (read-only workload)
+        print(f"Applied read-optimized PRAGMAs (cache=4GB, mmap=32GB, threads=6)")
     except Exception as e:
         print(f"Warning: Could not apply PRAGMAs: {e}")
 
 _apply_read_pragmas()
 
 def _safe_call(fn, *args, _tool_name=None, _timeout=120, **kwargs):
-    """Call a tool function with graceful timeout handling.
-
-    Sets a hard deadline on the store connection AND starts a timer thread
-    that calls connection.interrupt() after the deadline. The progress handler
-    fires every 50K VM instructions, but single instructions can block on HDD
-    I/O for 2-35 seconds. connection.interrupt() IS checked during I/O waits
-    (in the pager/B-tree layer), so it provides a much tighter time bound.
-    """
+    """Call a tool function with graceful timeout handling and retry."""
     import time as _time
     import threading as _threading
-    _CALL_DEADLINE = _timeout  # max seconds for any tool call
-    hard_deadline = _time.monotonic() + _CALL_DEADLINE
+    _CALL_DEADLINE = _timeout
 
-    # Set hard deadline on the store's thread-local
-    interrupt_timer = None
-    if hasattr(_store, '_local'):
-        _store._local.hard_deadline = hard_deadline
-        # Start timer to call conn.interrupt() — works even during I/O stalls
-        try:
-            conn = _store._conn()
-            interrupt_timer = _threading.Timer(_CALL_DEADLINE, conn.interrupt)
-            interrupt_timer.daemon = True
-            interrupt_timer.start()
-        except Exception:
-            pass  # Fallback to progress handler only
+    def _setup_deadline():
+        hard_deadline = _time.monotonic() + _CALL_DEADLINE
+        interrupt_timer = None
+        if hasattr(_store, '_local'):
+            _store._local.hard_deadline = hard_deadline
+            try:
+                conn = _store._conn()
+                interrupt_timer = _threading.Timer(_CALL_DEADLINE, conn.interrupt)
+                interrupt_timer.daemon = True
+                interrupt_timer.start()
+            except Exception:
+                pass
+        return interrupt_timer
 
+    interrupt_timer = _setup_deadline()
     try:
-        result = fn(*args, **kwargs)
-        if _tool_name:
-            result = _inject_vis_hint(result, _tool_name)
-        return _nfkc_normalize_response(result)
-    except sqlite3.OperationalError as e:
-        if "interrupted" in str(e):
-            return {
-                "error": "Query timed out — database under heavy I/O load.",
-                "suggestion": (
-                    "This tool needs to scan large tables which is slow during "
-                    "data ingestion. Try the fast-path tools instead: "
-                    "startability, tech_fit, firm_patent_portfolio, patent_market_fusion, "
-                    "startability_ranking, firm_tech_vector, tech_landscape, "
-                    "patent_compare, adversarial_strategy."
-                ),
-            }
-        raise
+        for _attempt in range(2):  # Retry once on I/O interrupt
+            try:
+                result = fn(*args, **kwargs)
+                if _tool_name:
+                    result = _inject_vis_hint(result, _tool_name)
+                result = add_interpretation(result, _tool_name or '')
+                result = _enrich_firm_ids(result)
+                return _nfkc_normalize_response(result)
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+                err_msg = str(e)
+                if "interrupted" in err_msg and _attempt == 0:
+                    _time.sleep(1)
+                    if interrupt_timer:
+                        interrupt_timer.cancel()
+                    interrupt_timer = _setup_deadline()
+                    continue
+                if "interrupted" in err_msg:
+                    return standardize_error({
+                        "error": "Query timed out — database under heavy I/O load.",
+                        "suggestion": (
+                            "This tool needs to scan large tables which is slow during "
+                            "data ingestion. Try the fast-path tools instead: "
+                            "startability, tech_fit, firm_patent_portfolio, patent_market_fusion, "
+                            "startability_ranking, firm_tech_vector, tech_landscape, "
+                            "patent_compare, adversarial_strategy."
+                        ),
+                    }, _tool_name or "")
+                if "malformed" in err_msg:
+                    return {
+                        "error": "FTS5 index needs rebuilding. Using fallback search.",
+                        "suggestion": (
+                            "The full-text search index has corruption from recent data "
+                            "ingestion. Text search may return fewer results. "
+                            "Try: tech_landscape, startability_ranking, or specify CPC codes "
+                            "directly instead of text queries."
+                        ),
+                    }
+                raise
     finally:
         if interrupt_timer is not None:
             interrupt_timer.cancel()
         if hasattr(_store, '_local'):
             _store._local.hard_deadline = None
-
-
 
 
 # ─── Visualization hints for all tools ───────────────────────────────
@@ -535,6 +679,75 @@ _VIS_HINTS = {
         "title": "ポートフォリオベンチマーク",
         "data_mapping": {"labels": "peer_ranking[].firm_name", "values": "peer_ranking[].patent_count"},
         "suggested_options": {"highlight_firm": True, "sort": "descending"},
+    },
+    # ── Monitoring ──
+    "create_watch": {
+        "recommended_chart": "card",
+        "title": "監視ウォッチ作成",
+        "data_mapping": {"title": "watch_id", "subtitle": "watch_type"},
+    },
+    "list_watches": {
+        "recommended_chart": "table",
+        "title": "監視ウォッチ一覧",
+        "data_mapping": {"columns": ["watch_id", "watch_type", "target", "last_checked"]},
+    },
+    "check_alerts": {
+        "recommended_chart": "table",
+        "title": "アラート一覧",
+        "data_mapping": {"columns": ["alert_id", "watch_id", "detected_at", "new_patents_count"]},
+    },
+    # ── Summary ──
+    "patent_summary": {
+        "recommended_chart": "card",
+        "title": "特許サマリ",
+        "data_mapping": {"title": "publication_number", "body": "summary"},
+    },
+    "technology_brief": {
+        "recommended_chart": "line_with_bar",
+        "title": "技術ブリーフ",
+        "data_mapping": {"x": "timeline[].year", "y_bar": "timeline[].count"},
+    },
+    # ── Visualization ──
+    "tech_map": {
+        "recommended_chart": "scatter",
+        "title": "技術マップ",
+        "data_mapping": {"x": "nodes[].x", "y": "nodes[].y", "size": "nodes[].patent_count", "label": "nodes[].label"},
+    },
+    "citation_graph_viz": {
+        "recommended_chart": "network",
+        "title": "引用ネットワーク",
+        "data_mapping": {"nodes": "nodes", "edges": "edges"},
+    },
+    "firm_landscape": {
+        "recommended_chart": "scatter",
+        "title": "企業ランドスケープ",
+        "data_mapping": {"x": "firms[].x", "y": "firms[].y", "size": "firms[].patent_count", "label": "firms[].name"},
+    },
+    "startability_heatmap": {
+        "recommended_chart": "heatmap",
+        "title": "Startabilityヒートマップ",
+        "data_mapping": {"rows": "firms", "columns": "clusters", "values": "matrix"},
+    },
+    # ── PTAB / Litigation ──
+    "ptab_search": {
+        "recommended_chart": "table",
+        "title": "PTAB審判検索",
+        "data_mapping": {"columns": ["trial_number", "patent_number", "petitioner", "patent_owner", "prosecution_status"]},
+    },
+    "ptab_risk": {
+        "recommended_chart": "gauge",
+        "title": "PTAB無効化リスク",
+        "data_mapping": {"value": "risk_score", "max": 1.0},
+    },
+    "litigation_search": {
+        "recommended_chart": "table",
+        "title": "訴訟検索",
+        "data_mapping": {"columns": ["case_number", "plaintiff", "defendant", "date_filed", "outcome"]},
+    },
+    "litigation_risk": {
+        "recommended_chart": "gauge",
+        "title": "訴訟リスク",
+        "data_mapping": {"value": "risk_score", "max": 1.0},
     },
 }
 
@@ -1357,7 +1570,7 @@ def tool_cross_border_similarity(
         Similar filings with similarity scores, time lags, CPC overlap,
         family relationships, and legal disclaimer note.
     """
-    raw = _safe_call(cross_border_similarity,
+    raw = _safe_call(cross_border_similarity, _timeout=60,
         store=_store, resolver=_resolver,
         query=query, query_type=query_type,
         target_jurisdictions=target_jurisdictions,
@@ -1758,7 +1971,7 @@ def tool_knowledge_flow(
     Identifies knowledge exporters (foundational tech) and importers (applied tech),
     spillover rates, and top flow pairs.
     """
-    raw = _safe_call(knowledge_flow, _timeout=120,
+    raw = _safe_call(knowledge_flow, _timeout=60,
         store=_store, resolver=_resolver,
         source_cpc=source_cpc, target_cpc=target_cpc,
         firm=firm, date_from=date_from, date_to=date_to, top_n=top_n)
@@ -2141,7 +2354,7 @@ def tool_fto_analysis(
 
     Returns:
         Risk assessment, blocking patents, risk by assignee, and expiry timeline."""
-    raw = _safe_call(fto_analysis, _tool_name="fto_analysis", _timeout=120,
+    raw = _safe_call(fto_analysis, _tool_name="fto_analysis", _timeout=60,
         store=_store, text=text, cpc_codes=cpc_codes,
         target_jurisdiction=target_jurisdiction, max_blocking=max_blocking)
     if isinstance(raw, dict) and "error" in raw:
@@ -2172,7 +2385,7 @@ def tool_create_category(
 
     Returns:
         Category ID, initial patent count, and sample classified patents."""
-    return _safe_call(create_category, _tool_name="create_category", _timeout=120,
+    return _safe_call(create_category, _tool_name="create_category", _timeout=60,
         store=_store, category_name=category_name, description=description,
         cpc_patterns=cpc_patterns, keywords=keywords)
 
@@ -2254,6 +2467,305 @@ def tool_portfolio_benchmark(
     if isinstance(raw, dict) and "error" in raw:
         return raw
     return _enrich_firm_ids(raw)
+
+
+# --- Monitoring tools ---
+
+@mcp.tool()
+def tool_create_watch(
+    watch_type: Annotated[str, Field(description="Watch type: 'applicant', 'cpc', 'keyword', or 'competitor'.")],
+    target: Annotated[str, Field(description="Watch target: company name, CPC code, keyword, or competitor name.")],
+    alert_threshold: Annotated[int, Field(description="Minimum new patents to trigger alert (default: 5).")] = 5,
+) -> dict:
+    """Create a patent monitoring watch to track new filings.
+
+    Monitors new patents by applicant, CPC code, keyword, or competitor activity.
+    Use run_monitoring to check for alerts.
+
+    Args:
+        watch_type: What to monitor ('applicant', 'cpc', 'keyword', 'competitor').
+        target: The entity to watch (company name, CPC code, or keyword).
+        alert_threshold: Minimum new patents to generate an alert.
+
+    Returns:
+        Watch ID and confirmation."""
+    return _safe_call(create_watch, _tool_name="create_watch", _timeout=30,
+        store=_store, watch_type=watch_type, target=target, alert_threshold=alert_threshold)
+
+
+@mcp.tool()
+def tool_list_watches(
+    page: Annotated[int, Field(description="Page number (default: 1).")] = 1,
+    page_size: Annotated[int, Field(description="Results per page (default: 20, max: 100).")] = 20,
+) -> dict:
+    """List all active patent monitoring watches.
+
+    Returns:
+        List of watches with last checked time and alert counts."""
+    return _safe_call(list_watches, _tool_name="list_watches", _timeout=30,
+        store=_store, page=page, page_size=page_size)
+
+
+@mcp.tool()
+def tool_check_alerts(
+    watch_id: Annotated[str | None, Field(description="Optional watch ID to filter alerts.")] = None,
+    acknowledged: Annotated[bool, Field(description="Include acknowledged alerts (default: False).")] = False,
+    page: Annotated[int, Field(description="Page number (default: 1).")] = 1,
+    page_size: Annotated[int, Field(description="Results per page (default: 20).")] = 20,
+) -> dict:
+    """Check patent monitoring alerts.
+
+    Returns unacknowledged alerts, optionally filtered by watch.
+
+    Args:
+        watch_id: Filter to specific watch.
+        acknowledged: If True, include already-acknowledged alerts.
+
+    Returns:
+        Alert list with new patent details."""
+    return _safe_call(check_alerts, _tool_name="check_alerts", _timeout=30,
+        store=_store, watch_id=watch_id, acknowledged=acknowledged, page=page, page_size=page_size)
+
+
+@mcp.tool()
+def tool_run_monitoring(
+    watch_id: Annotated[str | None, Field(description="Optional watch ID to run. If omitted, runs all watches.")] = None,
+) -> dict:
+    """Run patent monitoring for one or all watches.
+
+    Checks for new patents since last check and creates alerts.
+
+    Args:
+        watch_id: Specific watch to run, or None for all.
+
+    Returns:
+        Watches checked, alerts created, and summary."""
+    return _safe_call(run_monitoring, _tool_name="run_monitoring", _timeout=120,
+        store=_store, watch_id=watch_id)
+
+
+# --- Summary tools ---
+
+@mcp.tool()
+def tool_patent_summary(
+    publication_number: Annotated[str, Field(description="Patent publication number (e.g., 'JP-7637366-B1').")],
+    level: Annotated[str, Field(description="Detail level: 'simple', 'detailed', or 'expert' (default: 'simple').")] = "simple",
+) -> dict:
+    """Generate a structured summary of a patent.
+
+    Three levels: simple (title+abstract+CPC), detailed (adds citations/family),
+    expert (adds competitive context and positioning).
+
+    Args:
+        publication_number: Patent to summarize.
+        level: Detail level ('simple', 'detailed', 'expert').
+
+    Returns:
+        Structured patent summary at requested detail level."""
+    return _safe_call(patent_summary, _tool_name="patent_summary", _timeout=60,
+        store=_store, publication_number=publication_number, level=level)
+
+
+@mcp.tool()
+def tool_technology_brief(
+    query: Annotated[str | None, Field(description="Technology keyword (e.g., 'solid state battery').")] = None,
+    cpc_prefix: Annotated[str | None, Field(description="CPC prefix filter (e.g., 'H01M').")] = None,
+    date_from: Annotated[str | None, Field(description="Start date YYYY-MM-DD.")] = None,
+    date_to: Annotated[str | None, Field(description="End date YYYY-MM-DD.")] = None,
+) -> dict:
+    """Generate a technology area brief with trends and key players.
+
+    Provides overview of filing activity, top applicants, growth assessment,
+    and key findings for a technology area.
+
+    Args:
+        query: Technology keyword to analyze.
+        cpc_prefix: CPC code prefix (e.g., 'H01M' for batteries).
+
+    Returns:
+        Technology brief with trends, top applicants, and key findings."""
+    return _safe_call(technology_brief, _tool_name="technology_brief", _timeout=120,
+        store=_store, query=query, cpc_prefix=cpc_prefix, date_from=date_from, date_to=date_to)
+
+
+# --- Visualization tools ---
+
+@mcp.tool()
+def tool_tech_map(
+    cpc_prefix: Annotated[str | None, Field(description="CPC prefix (e.g., 'H01M').")] = None,
+    query: Annotated[str | None, Field(description="Technology keyword.")] = None,
+    firm_query: Annotated[str | None, Field(description="Company name for firm-centric map.")] = None,
+) -> dict:
+    """Generate technology map as nodes, edges, and Mermaid diagram.
+
+    Creates a bipartite graph of firms and technology areas for visualization.
+
+    Args:
+        cpc_prefix: CPC prefix for technology-centric map.
+        firm_query: Company name for firm-centric map.
+
+    Returns:
+        Nodes, edges, and Mermaid diagram string."""
+    return _safe_call(tech_map, _tool_name="tech_map", _timeout=60,
+        store=_store, cpc_prefix=cpc_prefix, query=query, firm_query=firm_query, resolver=_resolver)
+
+
+@mcp.tool()
+def tool_citation_graph_viz(
+    publication_number: Annotated[str, Field(description="Seed patent publication number.")],
+    depth: Annotated[int, Field(description="BFS depth (1 or 2, default: 1).")] = 1,
+    max_nodes: Annotated[int, Field(description="Maximum nodes (default: 30).")] = 30,
+) -> dict:
+    """Generate citation network visualization with Mermaid diagram.
+
+    Creates forward+backward citation graph from a seed patent.
+
+    Args:
+        publication_number: Seed patent.
+        depth: Traversal depth.
+        max_nodes: Maximum nodes in graph.
+
+    Returns:
+        Nodes, edges, and Mermaid flowchart."""
+    return _safe_call(citation_graph_viz, _tool_name="citation_graph_viz", _timeout=60,
+        store=_store, publication_number=publication_number, depth=depth, max_nodes=max_nodes)
+
+
+@mcp.tool()
+def tool_firm_landscape(
+    firms: Annotated[list[str], Field(description="List of company names to compare.")],
+    cpc_prefix: Annotated[str | None, Field(description="Optional CPC prefix filter.")] = None,
+) -> dict:
+    """Multi-firm patent landscape comparison chart data.
+
+    Compares patent portfolios across multiple firms with CPC distribution.
+
+    Args:
+        firms: List of company names to compare.
+        cpc_prefix: Optional CPC filter.
+
+    Returns:
+        Series data and CPC matrix for chart rendering."""
+    return _safe_call(firm_landscape, _tool_name="firm_landscape", _timeout=60,
+        store=_store, firms=firms, cpc_prefix=cpc_prefix, resolver=_resolver)
+
+
+@mcp.tool()
+def tool_startability_heatmap(
+    firms: Annotated[list[str] | None, Field(description="List of firm names (default: top 20).")] = None,
+    clusters: Annotated[list[str] | None, Field(description="List of cluster IDs (default: top 20).")] = None,
+    year: Annotated[int, Field(description="Analysis year (default: 2024).")] = 2024,
+) -> dict:
+    """Startability scores as heatmap data (firms x clusters).
+
+    Returns matrix of startability scores for visualization as heatmap.
+
+    Args:
+        firms: Firm names (default: top 20 by patent count).
+        clusters: Cluster IDs (default: top 20 by patent count).
+
+    Returns:
+        Rows (firms), columns (clusters), and values matrix."""
+    return _safe_call(startability_heatmap, _tool_name="startability_heatmap", _timeout=60,
+        store=_store, firms=firms, clusters=clusters, year=year, resolver=_resolver)
+
+
+# --- PTAB & Litigation tools ---
+
+@mcp.tool()
+def tool_ptab_search(
+    patent_number: Annotated[str | None, Field(description="US patent number to search.")] = None,
+    petitioner: Annotated[str | None, Field(description="Petitioner name (partial match).")] = None,
+    patent_owner: Annotated[str | None, Field(description="Patent owner name (partial match).")] = None,
+    status: Annotated[str | None, Field(description="Prosecution status filter.")] = None,
+    page: Annotated[int, Field(description="Page number (default: 1).")] = 1,
+    page_size: Annotated[int, Field(description="Results per page (default: 20).")] = 20,
+) -> dict:
+    """Search USPTO PTAB (Patent Trial and Appeal Board) trials.
+
+    Find inter partes review (IPR), post-grant review (PGR), and other
+    PTAB proceedings by patent number, petitioner, or owner.
+
+    Args:
+        patent_number: US patent number.
+        petitioner: Company that filed the challenge.
+        patent_owner: Patent holder.
+
+    Returns:
+        PTAB trial records with status and parties."""
+    return _safe_call(ptab_search, _tool_name="ptab_search", _timeout=30,
+        store=_store, patent_number=patent_number, petitioner=petitioner,
+        patent_owner=patent_owner, status=status, page=page, page_size=page_size)
+
+
+@mcp.tool()
+def tool_ptab_risk(
+    patent_number: Annotated[str | None, Field(description="Specific US patent number.")] = None,
+    cpc_prefix: Annotated[str | None, Field(description="CPC prefix for technology-level risk.")] = None,
+    applicant: Annotated[str | None, Field(description="Company name for portfolio-level risk.")] = None,
+) -> dict:
+    """Compute PTAB/IPR challenge risk score.
+
+    Assesses how likely a patent or portfolio is to face PTAB challenges
+    based on historical trial data and technology area patterns.
+
+    Args:
+        patent_number: Specific patent to assess.
+        cpc_prefix: Technology area risk.
+        applicant: Company portfolio risk.
+
+    Returns:
+        Risk score (0-1), trial statistics, and breakdown."""
+    return _safe_call(ptab_risk, _tool_name="ptab_risk", _timeout=60,
+        store=_store, patent_number=patent_number, cpc_prefix=cpc_prefix,
+        applicant=applicant, resolver=_resolver)
+
+
+@mcp.tool()
+def tool_litigation_search(
+    plaintiff: Annotated[str | None, Field(description="Plaintiff name (partial match).")] = None,
+    defendant: Annotated[str | None, Field(description="Defendant name (partial match).")] = None,
+    patent_number: Annotated[str | None, Field(description="Patent number involved.")] = None,
+    court: Annotated[str | None, Field(description="Court name filter.")] = None,
+    date_from: Annotated[str | None, Field(description="Start date YYYY-MM-DD.")] = None,
+    date_to: Annotated[str | None, Field(description="End date YYYY-MM-DD.")] = None,
+    page: Annotated[int, Field(description="Page number (default: 1).")] = 1,
+    page_size: Annotated[int, Field(description="Results per page (default: 20).")] = 20,
+) -> dict:
+    """Search patent litigation cases from USPTO data.
+
+    Find patent infringement lawsuits by party, patent, or court.
+
+    Args:
+        plaintiff: Suing party.
+        defendant: Defending party.
+        patent_number: Patent at issue.
+
+    Returns:
+        Litigation case records with parties, court, and outcome."""
+    return _safe_call(litigation_search, _tool_name="litigation_search", _timeout=30,
+        store=_store, plaintiff=plaintiff, defendant=defendant,
+        patent_number=patent_number, court=court, date_from=date_from,
+        date_to=date_to, page=page, page_size=page_size)
+
+
+@mcp.tool()
+def tool_litigation_risk(
+    firm_query: Annotated[str | None, Field(description="Company name for litigation risk.")] = None,
+    cpc_prefix: Annotated[str | None, Field(description="CPC prefix for technology-level risk.")] = None,
+) -> dict:
+    """Compute patent litigation risk for a firm or technology area.
+
+    Analyzes historical litigation patterns to assess lawsuit exposure.
+
+    Args:
+        firm_query: Company name.
+        cpc_prefix: Technology area.
+
+    Returns:
+        Risk score, case counts, top opponents, and breakdown."""
+    return _safe_call(litigation_risk, _tool_name="litigation_risk", _timeout=60,
+        store=_store, firm_query=firm_query, cpc_prefix=cpc_prefix, resolver=_resolver)
 
 
 # Infrastructure: argument parsing, cache warm-up, HTTP app
@@ -2403,6 +2915,11 @@ def _custom_http_app():
             "corporate_hierarchy", "group_portfolio", "group_startability",
             "claim_analysis", "claim_comparison", "fto_analysis",
             "create_category", "classify_patents", "category_landscape", "portfolio_benchmark",
+            "create_watch", "list_watches", "check_alerts", "run_monitoring",
+            "patent_summary", "technology_brief",
+            "tech_map", "citation_graph_viz", "firm_landscape", "startability_heatmap",
+            "tool_help", "tool_suggest",
+            "ptab_search", "ptab_risk", "litigation_search", "litigation_risk",
         ]))
         return JSONResponse({
             "status": "ok" if db_ok else "degraded",
@@ -2468,6 +2985,46 @@ def main() -> None:
         threading.Thread(target=_warm_cache, daemon=True).start()
         app = _custom_http_app()
         uvicorn.run(app, host=args.host, port=args.port)
+
+
+
+# =====================================================================
+# Meta-tools: Help & Suggest
+# =====================================================================
+@mcp.tool()
+def tool_tool_help(
+    tool_name: str | None = None,
+) -> dict:
+    """Get help for Patent Space MCP tools.
+
+    Without arguments: lists all 67+ tools by category.
+    With tool_name: shows parameters, examples, and usage tips.
+
+    Args:
+        tool_name: Specific tool to get help for (optional).
+
+    Returns:
+        Tool catalog or detailed help for one tool.
+    """
+    return tool_help(tool_name)
+
+
+@mcp.tool()
+def tool_tool_suggest(
+    context: str,
+) -> dict:
+    """Suggest which tools to use based on your analysis goal.
+
+    Describe what you want to do in natural language (Japanese or English),
+    and get ranked tool suggestions with examples.
+
+    Args:
+        context: Description of your analysis goal.
+
+    Returns:
+        Ranked list of suggested tools with examples.
+    """
+    return tool_suggest(context)
 
 if __name__ == "__main__":
     main()

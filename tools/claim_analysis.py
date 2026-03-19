@@ -18,6 +18,7 @@ import sqlite3
 from typing import Any
 
 from db.sqlite_store import PatentStore
+from tools.jp_tech_cpc_map import JP_TECH_CPC_MAP as _EXT_CPC
 from space.embedding_bridge import (
     _cosine_similarity,
     _unpack_embedding,
@@ -413,35 +414,59 @@ def _analyze_patent(store: PatentStore, pub_num: str) -> dict[str, Any]:
     if lookup_cpc:
         cpc_class_4 = lookup_cpc[:4] if len(lookup_cpc) >= 4 else lookup_cpc
         try:
-            rel_rows = conn.execute(
+            # Strategy: sample from patent_cpc with tight LIMIT,
+            # then sort by citations in Python
+            rel_candidates = conn.execute(
                 """
-                SELECT DISTINCT c.publication_number, p.title_ja, p.title_en,
-                       COALESCE(cc.forward_citations, 0) AS fwd_cit
+                SELECT c.publication_number
                 FROM patent_cpc c
-                JOIN patents p ON p.publication_number = c.publication_number
-                LEFT JOIN citation_counts cc ON cc.publication_number = c.publication_number
-                WHERE c.cpc_code LIKE ? || '%'
+                WHERE substr(c.cpc_code, 1, 4) = ?
+                  AND c.is_first = 1
                   AND c.publication_number != ?
-                ORDER BY fwd_cit DESC
-                LIMIT 10
+                LIMIT 500
                 """,
                 (cpc_class_4, pub_num),
             ).fetchall()
 
-            # Compute CPC overlap for each related patent
+            if rel_candidates:
+                candidate_pubs = [r["publication_number"] for r in rel_candidates]
+                ph = ",".join("?" for _ in candidate_pubs)
+                rel_rows = conn.execute(
+                    f"""
+                    SELECT p.publication_number, p.title_ja, p.title_en,
+                           COALESCE(ci.citation_count, 0) AS fwd_cit
+                    FROM patents p
+                    LEFT JOIN citation_impact ci ON ci.publication_number = p.publication_number
+                    WHERE p.publication_number IN ({ph})
+                    ORDER BY fwd_cit DESC
+                    LIMIT 10
+                    """,
+                    candidate_pubs,
+                ).fetchall()
+            else:
+                rel_rows = []
+
+            # Batch-fetch CPC codes for all related patents at once
             source_cpc_set = set(cpc_codes)
+            rel_pubs = [rr["publication_number"] for rr in rel_rows]
+            rel_cpc_map: dict[str, set] = {}
+            if rel_pubs:
+                ph = ",".join("?" for _ in rel_pubs)
+                try:
+                    all_rel_cpc = conn.execute(
+                        f"SELECT publication_number, cpc_code FROM patent_cpc "
+                        f"WHERE publication_number IN ({ph})",
+                        rel_pubs,
+                    ).fetchall()
+                    for rcr in all_rel_cpc:
+                        if rcr["cpc_code"]:
+                            rel_cpc_map.setdefault(rcr["publication_number"], set()).add(rcr["cpc_code"])
+                except sqlite3.OperationalError:
+                    pass
+
             for rr in rel_rows:
                 rel_pub = rr["publication_number"]
-                # Count how many CPC codes overlap
-                try:
-                    rel_cpc_rows = conn.execute(
-                        "SELECT cpc_code FROM patent_cpc WHERE publication_number = ?",
-                        (rel_pub,),
-                    ).fetchall()
-                    rel_cpc_set = {r["cpc_code"] for r in rel_cpc_rows if r["cpc_code"]}
-                except sqlite3.OperationalError:
-                    rel_cpc_set = set()
-
+                rel_cpc_set = rel_cpc_map.get(rel_pub, set())
                 overlap = len(source_cpc_set & rel_cpc_set)
 
                 related_patents.append({
@@ -863,21 +888,29 @@ def fto_analysis(
 
         cpc_where = " OR ".join(cpc_conditions)
 
+        import time as _time
+        _fto_deadline = _time.monotonic() + 45  # 45s budget for blocking patents
+
         try:
+            # Use a CPC subquery with LIMIT to cap the scan on patent_cpc (477M rows)
             bp_rows = conn.execute(
                 f"""
-                SELECT DISTINCT c.publication_number,
+                SELECT sub.publication_number,
                        p.title_ja, p.title_en,
                        p.filing_date, p.entity_status,
                        COALESCE(cc.forward_citations, 0) AS fwd_cit,
                        pls.status AS legal_status,
                        pls.expiry_date
-                FROM patent_cpc c
-                JOIN patents p ON p.publication_number = c.publication_number
-                LEFT JOIN citation_counts cc ON cc.publication_number = c.publication_number
-                LEFT JOIN patent_legal_status pls ON pls.publication_number = c.publication_number
-                WHERE ({cpc_where})
-                  AND (pls.status IS NULL OR pls.status = 'alive')
+                FROM (
+                    SELECT DISTINCT publication_number
+                    FROM patent_cpc
+                    WHERE ({cpc_where})
+                    LIMIT 50000
+                ) sub
+                JOIN patents p ON p.publication_number = sub.publication_number
+                LEFT JOIN citation_counts cc ON cc.publication_number = sub.publication_number
+                LEFT JOIN patent_legal_status pls ON pls.publication_number = sub.publication_number
+                WHERE (pls.status IS NULL OR pls.status = 'alive')
                 ORDER BY fwd_cit DESC
                 LIMIT ?
                 """,
@@ -928,8 +961,32 @@ def fto_analysis(
                     "risk_contribution": risk_contribution,
                 })
 
-        except sqlite3.OperationalError:
-            pass
+        except sqlite3.OperationalError as e:
+            if "interrupt" in str(e).lower():
+                # Timeout during blocking patent scan — return partial results
+                return {
+                    "endpoint": "fto_analysis",
+                    "technology_scope": {
+                        "input_text": text[:500] if text else None,
+                        "input_cpcs": cpc_codes,
+                        "matched_clusters": [
+                            {"cluster_id": c.get("cluster_id", ""), "label": c.get("label", ""), "patent_count": c.get("patent_count", 0)}
+                            for c in matched_clusters
+                        ],
+                    },
+                    "risk_assessment": {
+                        "overall_risk": "unknown",
+                        "risk_score": None,
+                        "total_patents_in_area": sum(c.get("patent_count", 0) for c in matched_clusters),
+                        "active_firms_count": active_firms_count,
+                        "note": "Query timed out during blocking patent scan. Partial cluster data available.",
+                    },
+                    "blocking_patents": [],
+                    "risk_by_assignee": [],
+                    "expiry_timeline": [],
+                    "recommendations": ["Retry with more specific CPC codes or narrower date range for faster results."],
+                    "disclaimer": _DISCLAIMER_FTO,
+                }
 
     # ------------------------------------------------------------------
     # Step 4: Aggregate risk by assignee

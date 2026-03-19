@@ -527,6 +527,13 @@ def technology_brief(
     Returns:
         Dict with 'endpoint' key and structured technology brief.
     """
+    import time as _time
+    _tb_start = _time.monotonic()
+    _tb_timed_out = False
+
+    def _tb_budget_left():
+        return max(0, 100 - (_time.monotonic() - _tb_start))
+
     if not query and not cpc_prefix:
         return {
             "endpoint": "technology_brief",
@@ -599,13 +606,17 @@ def technology_brief(
     try:
         total_patents = conn.execute(count_sql, count_params).fetchone()["cnt"]
     except sqlite3.OperationalError as e:
+        if "interrupt" in str(e).lower():
+            _tb_timed_out = True
         _log.warning(f"Count query failed: {e}")
         total_patents = -1  # unknown
 
     # ------------------------------------------------------------------
-    # Top applicants
+    # Top applicants (skip if time budget exhausted)
     # ------------------------------------------------------------------
-    if use_cpc and use_keyword:
+    if _tb_timed_out or _tb_budget_left() < 10:
+        top_applicants = []
+    elif use_cpc and use_keyword:
         keyword_like = f"%{query.strip()}%"
         applicant_sql = f"""
             SELECT pa.harmonized_name AS name, pa.firm_id,
@@ -656,7 +667,10 @@ def technology_brief(
         applicant_params = [keyword_like, keyword_like] + date_params + [top_n_applicants]
 
     try:
-        applicant_rows = conn.execute(applicant_sql, applicant_params).fetchall()
+        if not (_tb_timed_out or _tb_budget_left() < 10):
+            applicant_rows = conn.execute(applicant_sql, applicant_params).fetchall()
+        else:
+            applicant_rows = []
         top_applicants = [
             {
                 "name": r["name"],
@@ -671,13 +685,17 @@ def technology_brief(
             for r in applicant_rows
         ]
     except sqlite3.OperationalError as e:
+        if "interrupt" in str(e).lower():
+            _tb_timed_out = True
         _log.warning(f"Applicant query failed: {e}")
         top_applicants = []
 
     # ------------------------------------------------------------------
-    # Filing trend (by year)
+    # Filing trend (by year, skip if time budget exhausted)
     # ------------------------------------------------------------------
-    if use_cpc:
+    if _tb_timed_out or _tb_budget_left() < 10:
+        filing_trend = []
+    elif use_cpc:
         trend_sql = f"""
             SELECT CAST(p.publication_date / 10000 AS INTEGER) AS year,
                    COUNT(DISTINCT p.publication_number) AS cnt
@@ -705,9 +723,14 @@ def technology_brief(
         trend_params = [keyword_like, keyword_like] + date_params
 
     try:
-        trend_rows = conn.execute(trend_sql, trend_params).fetchall()
+        if not (_tb_timed_out or _tb_budget_left() < 10):
+            trend_rows = conn.execute(trend_sql, trend_params).fetchall()
+        else:
+            trend_rows = []
         filing_trend = [{"year": r["year"], "count": r["cnt"]} for r in trend_rows]
     except sqlite3.OperationalError as e:
+        if "interrupt" in str(e).lower():
+            _tb_timed_out = True
         _log.warning(f"Filing trend query failed: {e}")
         filing_trend = []
 
@@ -716,9 +739,11 @@ def technology_brief(
         filing_trend = filing_trend[-trend_years:]
 
     # ------------------------------------------------------------------
-    # CPC sub-distribution (subclass level, top 15)
+    # CPC sub-distribution (subclass level, top 15, skip if timed out)
     # ------------------------------------------------------------------
-    if use_cpc:
+    if _tb_timed_out or _tb_budget_left() < 10:
+        cpc_distribution = []
+    elif use_cpc:
         # Get sub-distribution within the prefix
         sub_sql = f"""
             SELECT SUBSTR(pc.cpc_code, 1, 4) AS subclass,
@@ -748,7 +773,10 @@ def technology_brief(
         sub_params = [keyword_like, keyword_like] + date_params
 
     try:
-        sub_rows = conn.execute(sub_sql, sub_params).fetchall()
+        if not (_tb_timed_out or _tb_budget_left() < 10):
+            sub_rows = conn.execute(sub_sql, sub_params).fetchall()
+        else:
+            sub_rows = []
         cpc_distribution = [
             {
                 "cpc_class": r["subclass"],
@@ -758,6 +786,8 @@ def technology_brief(
             for r in sub_rows
         ]
     except sqlite3.OperationalError as e:
+        if "interrupt" in str(e).lower():
+            _tb_timed_out = True
         _log.warning(f"CPC distribution query failed: {e}")
         cpc_distribution = []
 
@@ -887,12 +917,14 @@ def technology_brief(
         if cpc_label_full != cpc_prefix:
             technology_label = cpc_label_full
 
+    _partial_note = "Partial results due to query timeout. Try a more specific CPC prefix." if _tb_timed_out else None
     return {
         "endpoint": "technology_brief",
         "technology": technology_label,
         "query": query,
         "cpc_prefix": cpc_prefix,
         "total_patents": total_patents,
+        "note": _partial_note,
         "date_range": {
             "from": effective_date_from,
             "to": effective_date_to,

@@ -13,6 +13,24 @@ import numpy as np
 from scipy.stats import norm
 
 from db.sqlite_store import PatentStore
+
+
+def _resolve_firm_id_db(resolved, conn, table="firm_tech_vectors"):
+    """Resolve entity to DB firm_id with company_XXXX fallback."""
+    firm_id = resolved.entity.canonical_id if hasattr(resolved, 'entity') else str(resolved)
+    row = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE firm_id = ?", (firm_id,)).fetchone()
+    if row and row[0] > 0:
+        return firm_id
+    ticker = getattr(resolved.entity, 'ticker', None) if hasattr(resolved, 'entity') else None
+    if ticker:
+        alt_id = f"company_{ticker}"
+        row2 = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE firm_id = ?", (alt_id,)).fetchone()
+        if row2 and row2[0] > 0:
+            return alt_id
+    like_row = conn.execute(f"SELECT DISTINCT firm_id FROM {table} WHERE firm_id LIKE ? LIMIT 1", (f"{firm_id}%",)).fetchone()
+    if like_row:
+        return like_row[0]
+    return firm_id
 from entity.resolver import EntityResolver
 from tools.cpc_labels_ja import CPC_CLASS_JA
 from tools.royalty_benchmarks import get_royalty_rate, get_wacc, get_tax_rate, get_sector
@@ -81,12 +99,26 @@ def _find_clusters_for_cpc(conn, cpc_prefix: str, limit: int = 20) -> list[str]:
 
 
 def _find_best_year(conn, firm_id: str) -> int:
-    row = conn.execute(
+    """Find the latest year with substantial data for a firm.
+
+    Picks the latest year whose row count is >= 90% of the max count.
+    This avoids picking ancient years when counts are equal/similar.
+    """
+    rows = conn.execute(
         "SELECT year, COUNT(*) as cnt FROM startability_surface "
-        "WHERE firm_id = ? GROUP BY year ORDER BY cnt DESC LIMIT 1",
+        "WHERE firm_id = ? GROUP BY year ORDER BY cnt DESC",
         (firm_id,),
-    ).fetchone()
-    return row["year"] if row else 2024
+    ).fetchall()
+    if not rows:
+        return 2023
+    max_cnt = rows[0]["cnt"]
+    threshold = max(1, int(max_cnt * 0.9))
+    # Among years with >= 90% of max count, pick the latest
+    best = max(
+        (r["year"] for r in rows if r["cnt"] >= threshold),
+        default=rows[0]["year"],
+    )
+    return best
 
 
 def _keyword_to_cpc(query: str) -> str | None:
@@ -113,7 +145,7 @@ def _cluster_growth_rate(conn, cluster_id: str) -> float | None:
     """Get most recent growth_rate from tech_cluster_momentum."""
     row = conn.execute(
         "SELECT growth_rate FROM tech_cluster_momentum "
-        "WHERE cluster_id = ? ORDER BY year DESC LIMIT 1",
+        "WHERE cluster_id = ? AND year = (SELECT year FROM tech_cluster_momentum GROUP BY year HAVING AVG(growth_rate) > -0.3 ORDER BY year DESC LIMIT 1) LIMIT 1",
         (cluster_id,),
     ).fetchone()
     return float(row["growth_rate"]) if row and row["growth_rate"] is not None else None
@@ -189,7 +221,7 @@ def _estimate_S_K(conn, cpc_prefix: str, S_user: float | None,
         row = conn.execute(
             f"SELECT SUM(patent_count) as total FROM tech_cluster_momentum "
             f"WHERE cluster_id IN ({ph}) AND year = "
-            f"(SELECT MAX(year) FROM tech_cluster_momentum)",
+            f"(SELECT year FROM tech_cluster_momentum GROUP BY year HAVING AVG(growth_rate) > -0.3 ORDER BY year DESC LIMIT 1)",
             cluster_ids,
         ).fetchone()
         total_patents = (row["total"] or 0) if row else 0
@@ -381,25 +413,29 @@ def _option_value_firm(conn, firm_id: str, S_user, K_user, r, year) -> dict:
     actual_year = _find_best_year(conn, firm_id)
 
     # Get firm's top-cited patents (limit 1000 via citation_counts + patent_assignees)
+    # Use GROUP BY to eliminate duplicates from multiple assignees
     rows = conn.execute(
-        "SELECT pa.publication_number, cc.forward_citations, p.filing_date "
+        "SELECT pa.publication_number, MAX(cc.forward_citations) as forward_citations, "
+        "p.filing_date "
         "FROM patent_assignees pa "
         "JOIN citation_counts cc ON pa.publication_number = cc.publication_number "
         "JOIN patents p ON pa.publication_number = p.publication_number "
         "WHERE pa.firm_id = ? "
-        "ORDER BY cc.forward_citations DESC LIMIT 1000",
+        "GROUP BY pa.publication_number "
+        "ORDER BY forward_citations DESC LIMIT 1000",
         (firm_id,),
     ).fetchall()
 
     if not rows:
         # Fallback: try without citation_counts
         rows = conn.execute(
-            "SELECT pa.publication_number, p.citation_count_forward as forward_citations, "
+            "SELECT pa.publication_number, MAX(p.citation_count_forward) as forward_citations, "
             "p.filing_date "
             "FROM patent_assignees pa "
             "JOIN patents p ON pa.publication_number = p.publication_number "
             "WHERE pa.firm_id = ? "
-            "ORDER BY p.citation_count_forward DESC LIMIT 500",
+            "GROUP BY pa.publication_number "
+            "ORDER BY forward_citations DESC LIMIT 500",
             (firm_id,),
         ).fetchall()
 
@@ -424,6 +460,7 @@ def _option_value_firm(conn, firm_id: str, S_user, K_user, r, year) -> dict:
     values = []
     remaining_dist: dict[str, int] = {}
     top_patents = []
+    seen_pubs: set[str] = set()
     greeks_agg = {"delta": [], "gamma": [], "theta": [], "vega": [], "rho": []}
 
     for row in rows:
@@ -450,9 +487,11 @@ def _option_value_firm(conn, firm_id: str, S_user, K_user, r, year) -> dict:
         bucket = f"{max(0, T)}"
         remaining_dist[bucket] = remaining_dist.get(bucket, 0) + 1
 
-        if len(top_patents) < 10 and adj_val > 0:
+        pub = row["publication_number"]
+        if len(top_patents) < 10 and adj_val > 0 and pub not in seen_pubs:
+            seen_pubs.add(pub)
             top_patents.append({
-                "patent": row["publication_number"],
+                "patent": pub,
                 "option_value": round(adj_val, 2),
                 "cited_by": cited_by,
                 "remaining_years": T,
@@ -655,8 +694,24 @@ def tech_volatility(
             "years_found": len(counts),
         }
 
-    # Log returns
-    returns = _log_returns(counts)
+    # Detect and flag incomplete final year data
+    # 2024+ is known incomplete; also flag if count < 50% of previous year
+    incomplete_year = None
+    sorted_years = sorted(counts.keys())
+    if len(sorted_years) >= 2:
+        last_yr = sorted_years[-1]
+        prev_yr = sorted_years[-2]
+        if last_yr >= 2024 or counts[last_yr] < counts[prev_yr] * 0.5:
+            incomplete_year = last_yr
+            # Exclude incomplete year from volatility calculation
+            counts_for_calc = {y: c for y, c in counts.items() if y != last_yr}
+        else:
+            counts_for_calc = counts
+    else:
+        counts_for_calc = counts
+
+    # Log returns (using clean data without incomplete year)
+    returns = _log_returns(counts_for_calc)
     sigma = float(np.std(returns)) if returns else 0
     drift = float(np.mean(returns)) if returns else 0
     tech_sharpe = drift / sigma if sigma > 1e-6 else 0
@@ -671,57 +726,68 @@ def tech_volatility(
     else:
         regime = "declining"
 
-    # Decay curve from citation lag (sampled, with sub-timeout)
+    # Decay curve from citation_impact + patent filing dates (fast, no heavy JOINs)
     decay_curve = []
     half_life = None
-    if cluster_ids:
-        import threading as _thr
-        _decay_conn = store._conn()
-        _decay_timer = _thr.Timer(8.0, _decay_conn.interrupt)
-        _decay_timer.daemon = True
-        try:
-            _decay_timer.start()
-            sample_rows = _decay_conn.execute(
-                """SELECT
-                    CAST(SUBSTR(p2.filing_date, 1, 4) AS INTEGER) -
-                    CAST(SUBSTR(p1.filing_date, 1, 4) AS INTEGER) as lag
-                FROM patent_citations pc
-                JOIN patents p1 ON pc.cited_publication = p1.publication_number
-                JOIN patents p2 ON pc.citing_publication = p2.publication_number
-                JOIN patent_cpc cpc ON pc.cited_publication = cpc.publication_number
-                WHERE cpc.cpc_code LIKE ?
-                AND p1.filing_date IS NOT NULL AND p2.filing_date IS NOT NULL
-                AND p1.filing_date > 0 AND p2.filing_date > 0
-                LIMIT 5000""",
-                (f"{cpc_prefix}%",),
-            ).fetchall()
-            _decay_timer.cancel()
+    try:
+        # Get a sample of cited patents in this CPC area with their citation counts
+        # and filing years, then compute age-based decay
+        # 2-step: get publication_numbers from patent_cpc, then lookup
+        cpc_pubs = conn.execute(
+            """SELECT publication_number FROM patent_cpc
+            WHERE substr(cpc_code, 1, 4) = ? AND is_first = 1
+            LIMIT 20000""",
+            (cpc4,),
+        ).fetchall()
+        pub_ids = [r["publication_number"] for r in cpc_pubs]
 
-            if sample_rows:
-                lags = [r["lag"] for r in sample_rows
-                        if r["lag"] is not None and 0 <= r["lag"] <= 30]
-                if lags:
-                    from collections import Counter
-                    lag_counts = Counter(lags)
-                    max_lag = max(lag_counts.keys())
-                    total = sum(lag_counts.values())
-                    cumulative = 0
-                    for lag_yr in range(0, min(max_lag + 1, 25)):
-                        c = lag_counts.get(lag_yr, 0)
-                        cumulative += c
-                        decay_curve.append({
-                            "lag_years": lag_yr,
-                            "citation_count": c,
-                            "cumulative_pct": round(cumulative / total, 4),
-                        })
-                        if half_life is None and cumulative >= total * 0.5:
-                            half_life = lag_yr
-        except Exception:
-            _decay_timer.cancel()
-            # Decay curve skipped due to timeout — use heuristic
-            half_life = 5  # Industry average
+        sample_rows = []
+        if pub_ids:
+            # Batch lookup in citation_impact + patents
+            BATCH = 2000
+            for i in range(0, min(len(pub_ids), 10000), BATCH):
+                batch = pub_ids[i:i+BATCH]
+                ph = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"""SELECT ci.citation_count,
+                              CAST(p.filing_date / 10000 AS INTEGER) as filing_year
+                    FROM citation_impact ci
+                    JOIN patents p ON ci.publication_number = p.publication_number
+                    WHERE ci.publication_number IN ({ph})
+                      AND p.filing_date > 0
+                      AND ci.citation_count > 0""",
+                    batch,
+                ).fetchall()
+                sample_rows.extend(rows)
 
-    # Timeline
+        if sample_rows:
+            from collections import Counter
+            # Compute age distribution of citations weighted by count
+            current_yr = max(counts.keys()) if counts else 2023
+            age_counts = Counter()
+            for r in sample_rows:
+                age = current_yr - r["filing_year"]
+                if 0 <= age <= 30:
+                    age_counts[age] += r["citation_count"]
+
+            if age_counts:
+                max_age = max(age_counts.keys())
+                total_cit = sum(age_counts.values())
+                cumulative = 0
+                for age_yr in range(0, min(max_age + 1, 25)):
+                    c = age_counts.get(age_yr, 0)
+                    cumulative += c
+                    decay_curve.append({
+                        "lag_years": age_yr,
+                        "citation_count": c,
+                        "cumulative_pct": round(cumulative / total_cit, 4),
+                    })
+                    if half_life is None and cumulative >= total_cit * 0.5:
+                        half_life = age_yr
+    except Exception:
+        half_life = 5  # Industry average
+
+    # Timeline (includes all years, incomplete year flagged)
     timeline = []
     years = sorted(counts.keys())
     for i, y in enumerate(years):
@@ -730,29 +796,43 @@ def tech_volatility(
             entry["log_return"] = round(
                 math.log(counts[y] / counts[years[i - 1]]), 4
             )
+        if incomplete_year and y == incomplete_year:
+            entry["incomplete"] = True
+            entry["note"] = "データ取り込み未完了のため件数が過少"
         timeline.append(entry)
 
-    # Percentile vs all technologies — single batch query
+    # Percentile vs all tech clusters (filtered: avg >= 100 patents/yr, >= 3 years)
+    # Use same year range as our sigma (exclude incomplete years)
     percentile = 50
     try:
+        compare_year_to = (year_to - 1) if incomplete_year else year_to
         all_momentum = conn.execute(
             "SELECT cluster_id, year, patent_count "
             "FROM tech_cluster_momentum "
             "WHERE year BETWEEN ? AND ? "
             "ORDER BY cluster_id, year",
-            (year_from, year_to),
+            (year_from, compare_year_to),
         ).fetchall()
-        # Group by cluster and compute sigma
-        from itertools import groupby
-        cluster_sigmas = []
-        for cid, rows in groupby(all_momentum, key=lambda r: r["cluster_id"]):
-            yearly = {r["year"]: r["patent_count"] for r in rows}
+        cluster_data: dict[str, dict[int, int]] = {}
+        for r in all_momentum:
+            cid = r["cluster_id"]
+            cluster_data.setdefault(cid, {})[r["year"]] = r["patent_count"]
+
+        comparison_sigmas = []
+        for cid, yearly in cluster_data.items():
+            if len(yearly) < 3:
+                continue
+            avg_cnt = sum(yearly.values()) / len(yearly)
+            if avg_cnt < 100:
+                continue  # Skip tiny clusters (noisy log returns)
             rets = _log_returns(yearly)
             if len(rets) >= 2:
-                cluster_sigmas.append(float(np.std(rets)))
-        if cluster_sigmas and sigma > 0:
+                comparison_sigmas.append(float(np.std(rets)))
+
+        if comparison_sigmas and sigma > 0:
             percentile = round(
-                sum(1 for s in cluster_sigmas if s < sigma) / len(cluster_sigmas) * 100
+                sum(1 for s in comparison_sigmas if s < sigma)
+                / len(comparison_sigmas) * 100
             )
     except Exception:
         percentile = 50  # Fallback
@@ -774,7 +854,7 @@ def tech_volatility(
     if half_life is not None:
         interp_parts.append(f"被引用半減期{half_life}年")
 
-    return {
+    result = {
         "endpoint": "tech_volatility",
         "cpc_prefix": cpc_prefix,
         "cpc_label": label,
@@ -801,6 +881,12 @@ def tech_volatility(
             },
         },
     }
+    if incomplete_year:
+        result["incomplete_year_note"] = (
+            f"{incomplete_year}年のデータは取り込み未完了のため、"
+            f"ボラティリティ計算から除外しています。"
+        )
+    return result
 
 
 # ─── Tool 3: portfolio_var ──────────────────────────────────────────
@@ -832,6 +918,10 @@ def portfolio_var(
     firm_id = _resolve_firm(resolver, firm)
     if not firm_id:
         return {"error": f"Could not resolve firm: '{firm}'"}
+    # DB fallback: check if firm_id exists, try company_XXXX
+    _resolved = resolver.resolve(firm, country_hint="JP") if resolver else None
+    if _resolved:
+        firm_id = _resolve_firm_id_db(_resolved, conn, "firm_tech_vectors")
 
     actual_year = _find_best_year(conn, firm_id)
 
@@ -847,7 +937,21 @@ def portfolio_var(
     dominant_cpc = _cpc4((ftv["dominant_cpc"] or "H01M") if ftv else "H01M")
 
     if total_patents == 0:
-        return {"error": f"No patent data in firm_tech_vectors for: '{firm_id}'"}
+        # Fallback: try LIKE match for parent/subsidiary
+        like_row = conn.execute(
+            "SELECT firm_id, patent_count, dominant_cpc, tech_diversity, tech_vector "
+            "FROM firm_tech_vectors WHERE firm_id LIKE ? AND year = ? "
+            "ORDER BY patent_count DESC LIMIT 1",
+            (f"{firm_id}%", actual_year),
+        ).fetchone()
+        if like_row:
+            firm_id = like_row["firm_id"]
+            total_patents = like_row["patent_count"] or 0
+            tech_diversity = like_row["tech_diversity"] or 0
+            dominant_cpc = _cpc4((like_row["dominant_cpc"] or "H01M"))
+            ftv = like_row
+        if total_patents == 0:
+            return {"error": f"No patent data in firm_tech_vectors for: '{firm_id}'"}
 
     # ── Startability surface data for this firm ────────────────────
 
@@ -1260,7 +1364,7 @@ def tech_beta(
     q = query.strip()
 
     # Resolve to CPC prefix(es)
-    if query_type == "firm" or (resolver and q and not q[:1].isalpha()):
+    if query_type == "firm" or (resolver and q and (not q[:1].isascii() or not q[:1].isalpha())):
         firm_id = _resolve_firm(resolver, q) if resolver else None
         if firm_id:
             ftv = conn.execute(

@@ -1,6 +1,8 @@
 """tech_landscape tool implementation."""
 from __future__ import annotations
 
+import sqlite3
+
 import math
 from typing import Any
 
@@ -25,28 +27,46 @@ def tech_landscape(
     if granularity not in {"year", "quarter"}:
         granularity = "year"
 
-    total_patents = store.count(
-        query=query,
-        cpc_prefix=cpc_prefix,
-        date_from=date_from_int,
-        date_to=date_to_int,
-    )
+    try:
+        total_patents = store.count(
+            query=query,
+            cpc_prefix=cpc_prefix,
+            date_from=date_from_int,
+            date_to=date_to_int,
+        )
+    except sqlite3.OperationalError as e:
+        if "interrupt" in str(e).lower():
+            total_patents = -1  # unknown due to timeout
+        else:
+            raise
 
-    cpc_trend = store.get_cpc_trend(
-        cpc_prefix=cpc_prefix,
-        date_from=date_from_int,
-        date_to=date_to_int,
-        granularity=granularity,
-        query=query,
-    )
+    try:
+        cpc_trend = store.get_cpc_trend(
+            cpc_prefix=cpc_prefix,
+            date_from=date_from_int,
+            date_to=date_to_int,
+            granularity=granularity,
+            query=query,
+        )
+    except sqlite3.OperationalError as e:
+        if "interrupt" in str(e).lower():
+            cpc_trend = []  # partial: no trend data
+        else:
+            raise
 
-    top_rows = store.get_top_applicants_for_cpc(
-        cpc_prefix=cpc_prefix,
-        date_from=date_from_int,
-        date_to=date_to_int,
-        limit=20,
-        query=query,
-    )
+    try:
+        top_rows = store.get_top_applicants_for_cpc(
+            cpc_prefix=cpc_prefix,
+            date_from=date_from_int,
+            date_to=date_to_int,
+            limit=20,
+            query=query,
+        )
+    except sqlite3.OperationalError as e:
+        if "interrupt" in str(e).lower():
+            top_rows = []  # partial: no applicant data
+        else:
+            raise
     top_applicants = []
     for row in top_rows:
         share = 0.0
